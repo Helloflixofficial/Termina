@@ -77,7 +77,7 @@ impl Fixture {
         let desc = tic.decode().unwrap();
         let (mut tx, cache, gmmu) = self.tx();
         cache
-            .texture(&mut tx, gmmu, &desc)
+            .texture(&mut tx, gmmu, &desc, Usage::Sample)
             .unwrap()
             .expect("a cached texture")
     }
@@ -1111,7 +1111,10 @@ fn measures_upload_and_lookup_cost() {
     let start = Instant::now();
     for _ in 0..lookups {
         let (mut tx, cache, gmmu) = f.tx();
-        let found = cache.texture(&mut tx, gmmu, &desc).unwrap().unwrap();
+        let found = cache
+            .texture(&mut tx, gmmu, &desc, Usage::Sample)
+            .unwrap()
+            .unwrap();
         assert_eq!(found.0, id);
     }
     let lookup = start.elapsed();
@@ -1731,7 +1734,7 @@ fn images_over_the_texel_limit_are_sparse_and_bind_what_the_gpu_writes() {
     let desc = tic(0x08, GPU_VA, 2048, 2048, 65, 1, 4).decode().unwrap();
     assert_eq!(
         cache
-            .texture(&mut tx, gmmu, &desc)
+            .texture(&mut tx, gmmu, &desc, Usage::Sample)
             .unwrap()
             .map(|(id, _)| id),
         Some(found.id),
@@ -3646,4 +3649,323 @@ fn slice_targets_join_with_their_aliases_newer_texels() {
         assert_eq!(wrong, 0, "{gob:?}: slice 0 texels");
         f.assert_no_validation_errors();
     }
+}
+
+/// The TIC of a `w`x`h` array of `layers` layers and `levels` levels in `raw` format with
+/// `float` components (BC6H) or sRGB (ASTC).
+fn array_tic(
+    raw: u32,
+    srgb: bool,
+    float: bool,
+    gpu_va: GpuVAddr,
+    size: (u32, u32, u32, u32),
+) -> TicEntry {
+    let (w, h, layers, levels) = size;
+    let mut header = tic(raw, gpu_va, w, h, layers, levels, 3);
+    if float {
+        header.0[0] =
+            raw | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    }
+    if srgb {
+        header.0[4] |= 1 << 22;
+    }
+    header
+}
+
+#[test]
+fn sampled_arrays_too_large_for_the_host_keep_their_smaller_levels_over_sparse_pages() {
+    let gob = GobLayout::Switch2;
+    for (raw, srgb, float, format, trim) in [
+        (0x44, true, false, PixelFormat::Astc8x8Srgb, 2),
+        (0x11, false, true, PixelFormat::Bc6hUfloat, 1),
+    ] {
+        let size = (512, 512, 4, 6);
+        let (w, h, layers, levels) = size;
+        let s = surface(format, w, h, levels, layers, 3, gob);
+        let data = level_data(&s, 5);
+        let Some(mut reference) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&reference.memory, &s, &data);
+        let (full, _) = reference.texture(&array_tic(raw, srgb, float, GPU_VA, size));
+        let want = reference.read_image(full);
+        drop(reference);
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&f.memory, &s, &data);
+        f.cache.trim_above = 1 << 20;
+        f.cache.trim_to = 512 << 10;
+        let va = GPU_VA + DRAM;
+        let page = 0x1000;
+        let bytes = s.size_bytes().next_multiple_of(page);
+        f.gmmu.map_sparse(va, bytes, false).unwrap();
+        let map_layer = |f: &mut Fixture, layer: u32, from: u32| {
+            let lo = s.subresource_offset(from, layer) / page * page;
+            let hi = (s.subresource_offset(levels - 1, layer) + s.level_size(levels - 1))
+                .next_multiple_of(page);
+            f.gmmu.map(va + lo, DADDR + lo, hi - lo, 0, false).unwrap();
+        };
+        for layer in [0, 1, 3] {
+            map_layer(&mut f, layer, trim);
+        }
+        let header = array_tic(raw, srgb, float, va, size);
+        let (id, view) = f.texture(&header);
+        let extent = f.cache.state(id).unwrap().extent;
+        let kept = levels - trim;
+        for (base, want_base, want_levels) in [(0, 0, kept), (trim + 1, 1, kept - 1)] {
+            let view = ViewInfo {
+                base_level: base,
+                levels: levels - base,
+                ..view
+            };
+            assert!(f.cache.view(id, &view).unwrap().is_some(), "{format:?}");
+            let key = f.cache.get(id).unwrap().views.last().unwrap().0;
+            assert_eq!(
+                (key.base_level, key.levels),
+                (want_base, want_levels),
+                "{format:?}: guest levels {base}.. view host levels from {want_base}"
+            );
+        }
+        assert_eq!(
+            extent.width,
+            w >> trim,
+            "{format:?}: keeps levels from {trim}"
+        );
+        assert_eq!(extent.height, h >> trim);
+        let check = |f: &mut Fixture, unmapped: &[u32]| {
+            let got = f.read_image(id);
+            assert_eq!(got.len(), (layers * kept) as usize, "{format:?}");
+            for layer in 0..layers {
+                for level in trim..levels {
+                    let texels = &got[(layer * kept + level - trim) as usize];
+                    let reference = &want[(layer * levels + level) as usize];
+                    if unmapped.contains(&layer) {
+                        assert!(
+                            texels.iter().all(|&b| b == 0),
+                            "{format:?}: unmapped layer {layer} level {level} reads zero"
+                        );
+                    } else {
+                        assert!(
+                            texels == reference,
+                            "{format:?}: layer {layer} level {level} holds guest level {level}"
+                        );
+                    }
+                }
+            }
+        };
+        check(&mut f, &[2]);
+        map_layer(&mut f, 2, trim);
+        let (again, _) = f.texture(&header);
+        assert_eq!(again, id, "{format:?}: newly mapped pages join the image");
+        check(&mut f, &[]);
+        f.assert_no_validation_errors();
+    }
+}
+
+#[test]
+fn sampled_arrays_whose_leading_pages_are_sparse_read_zero_there() {
+    let gob = GobLayout::Switch2;
+    for (raw, srgb, float, format) in [
+        (0x44, true, false, PixelFormat::Astc8x8Srgb),
+        (0x11, false, true, PixelFormat::Bc6hUfloat),
+    ] {
+        let size = (256, 256, 2, 3);
+        let (w, h, layers, levels) = size;
+        let s = surface(format, w, h, levels, layers, 3, gob);
+        let data = level_data(&s, 9);
+        let Some(mut reference) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&reference.memory, &s, &data);
+        let (full, _) = reference.texture(&array_tic(raw, srgb, float, GPU_VA, size));
+        let want = reference.read_image(full);
+        drop(reference);
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&f.memory, &s, &data);
+        let va = GPU_VA + DRAM;
+        let page = 0x1000;
+        let bytes = s.size_bytes().next_multiple_of(page);
+        let hole = s.subresource_offset(0, 1) / page * page;
+        assert!(
+            hole >= s.level_size(0),
+            "{format:?}: layer 0 level 0 is unmapped"
+        );
+        f.gmmu.map_sparse(va, bytes, false).unwrap();
+        f.gmmu
+            .map(va + hole, DADDR + hole, bytes - hole, 0, false)
+            .unwrap();
+        let (id, _) = f.texture(&array_tic(raw, srgb, float, va, size));
+        let got = f.read_image(id);
+        assert!(
+            got[0].iter().all(|&b| b == 0),
+            "{format:?}: the unmapped level reads zero"
+        );
+        for level in 0..levels {
+            let i = (levels + level) as usize;
+            assert!(
+                got[i] == want[i],
+                "{format:?}: mapped layer 1 level {level}"
+            );
+        }
+        f.assert_no_validation_errors();
+    }
+}
+
+#[test]
+fn a_remap_dirties_only_the_bytes_whose_mapping_changed() {
+    let seg = |offset, daddr, size| Segment {
+        offset,
+        daddr,
+        size,
+    };
+    let old = [
+        seg(0, 0x1000, 100),
+        seg(200, 0x5000, 100),
+        seg(400, 0x9000, 50),
+    ];
+    let new = [
+        seg(0, 0x1000, 150),
+        seg(200, 0x7000, 100),
+        seg(400, 0x9000, 50),
+    ];
+    let mut changed = Vec::new();
+    remapped_bytes(&old, &new, |lo, hi| changed.push((lo, hi)));
+    assert_eq!(changed, [(100, 150), (200, 300)]);
+    changed.clear();
+    remapped_bytes(&new, &old[..1], |lo, hi| changed.push((lo, hi)));
+    assert_eq!(changed, [(100, 150), (200, 300), (400, 450)]);
+}
+
+#[test]
+fn an_allocation_out_of_memory_evicts_clean_images_unused_this_frame() {
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let tics: Vec<_> = (0..6)
+        .map(|i| tic(0x08, GPU_VA + i * 0x1_0000, 64, 64, 1, 1, 2))
+        .collect();
+    let ids: Vec<_> = tics.iter().map(|t| f.texture(t).0).collect();
+    let info = rt_info(64, 64, 2, gob);
+    let modified = clear_rt_at(
+        &mut f,
+        GPU_VA + 0x10_0000,
+        &info,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    )
+    .id;
+    f.tick(HUGE_BUDGET);
+    for t in &tics[4..] {
+        f.texture(t);
+    }
+    let size = f.cache.get(ids[0]).unwrap().image.memory_size();
+    let freed = {
+        let (mut tx, cache, _) = f.tx();
+        cache.evict_unused(&mut tx, u64::MAX).unwrap()
+    };
+    assert_eq!(freed, 4 * size);
+    let live: Vec<bool> = ids.iter().map(|&id| f.cache.get(id).is_some()).collect();
+    assert_eq!(
+        live,
+        [false, false, false, false, true, true],
+        "images used this frame stay"
+    );
+    assert!(f.cache.get(modified).is_some(), "GPU-modified images stay");
+    {
+        let (mut tx, cache, _) = f.tx();
+        assert_eq!(cache.evict_unused(&mut tx, u64::MAX).unwrap(), 0);
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn storage_lookups_keep_every_level_of_arrays_that_samples_trim() {
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    f.cache.trim_above = 1 << 20;
+    f.cache.trim_to = 512 << 10;
+    let header = tic(0x08, GPU_VA, 512, 512, 4, 4, 3);
+    let (sampled, _) = f.texture(&header);
+    assert_eq!(f.cache.state(sampled).unwrap().extent.width, 128);
+    let desc = header.decode().unwrap();
+    let (stored, _) = {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .texture(&mut tx, gmmu, &desc, Usage::Storage)
+            .unwrap()
+            .unwrap()
+    };
+    assert_ne!(
+        stored, sampled,
+        "a storage image never stands in for a trimmed one"
+    );
+    assert_eq!(f.cache.state(stored).unwrap().extent.width, 512);
+    assert_eq!(f.cache.get(stored).unwrap().image.desc().mip_levels, 4);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn a_layer_lookup_leaves_a_remapped_array_whole() {
+    let gob = GobLayout::Switch2;
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 1, 2, 2, gob);
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    write_surface(&f.memory, &s, &level_data(&s, 3));
+    let va = GPU_VA + DRAM;
+    let bytes = s.size_bytes().next_multiple_of(0x1000);
+    let stride = s.subresource_offset(0, 1);
+    f.gmmu.map_sparse(va, bytes, false).unwrap();
+    f.gmmu.map(va, DADDR, stride, 0, false).unwrap();
+    let array = tic(0x08, va, 64, 64, 2, 1, 2);
+    let (id, _) = f.texture(&array);
+    f.gmmu.map(va, DADDR, bytes, 0, false).unwrap();
+    assert_eq!(f.texture(&array).0, id, "the backed array keeps its image");
+    let want = f.read_image(id);
+    assert!(want[1].iter().any(|&b| b != 0));
+    f.texture(&tic(0x08, va, 64, 64, 1, 1, 2));
+    assert_eq!(f.texture(&array).0, id);
+    assert!(f.read_image(id) == want, "layer 1 keeps its texels");
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn a_remapped_array_takes_newer_gpu_writes_over_its_new_pages() {
+    let gob = GobLayout::Switch2;
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 1, 2, 2, gob);
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let va = GPU_VA + DRAM;
+    let bytes = s.size_bytes().next_multiple_of(0x1000);
+    let stride = s.subresource_offset(0, 1);
+    f.gmmu.map_sparse(va, bytes, false).unwrap();
+    f.gmmu.map(va, DADDR, stride, 0, false).unwrap();
+    let array = tic(0x08, va, 64, 64, 2, 1, 2);
+    let (id, _) = f.texture(&array);
+    let info = rt_info(64, 64, 2, gob);
+    assert_eq!(info.size_bytes(), bytes - stride);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 0x10_0000,
+        &info,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    f.gmmu
+        .map(va + stride, DADDR + 0x10_0000, bytes - stride, 0, false)
+        .unwrap();
+    assert_eq!(f.texture(&array).0, id);
+    let got = f.read_image(id);
+    assert!(
+        got[1].chunks(4).all(|t| t == [0, 255, 0, 255]),
+        "layer 1 holds the render target's clear"
+    );
+    f.assert_no_validation_errors();
 }
