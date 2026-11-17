@@ -16,8 +16,8 @@ use crate::backend::{
 };
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
 use crate::clock::{GpuClockSpeed, GuestTime};
-use crate::engines::maxwell_3d::Regs;
 use crate::engines::maxwell_3d::regs::PrimitiveTopology;
+use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
 use crate::engines::{Engine, EngineContext, EngineKind, create_engine};
 use crate::gmmu::{BigPageSize, Gmmu};
 use crate::gpu::{Console, Gpu, GpuConfig, Threading};
@@ -97,10 +97,15 @@ type Log = Arc<Mutex<Vec<Event>>>;
 struct RecordingEngine {
     engine: EngineKind,
     log: Log,
+    /// The 3D registers, for macros the back runs.
+    state: RegisterState,
 }
 
 impl Engine for RecordingEngine {
     fn call_method(&mut self, ctx: &mut EngineContext<'_>, method: u32, argument: u32) {
+        if self.engine == EngineKind::Maxwell3d && method < MACRO_REGISTERS_START {
+            self.state.write(method, argument);
+        }
         self.log.lock().push(Event::Method {
             channel: ctx.channel.0,
             engine: self.engine,
@@ -122,6 +127,10 @@ impl Engine for RecordingEngine {
 
     fn flush(&mut self, _ctx: &mut EngineContext<'_>) {
         self.log.lock().push(Event::Flush(self.engine));
+    }
+
+    fn graphics_state(&self) -> Option<&RegisterState> {
+        (self.engine == EngineKind::Maxwell3d).then_some(&self.state)
     }
 }
 
@@ -420,6 +429,7 @@ impl Rig {
                     _ => Some(Box::new(RecordingEngine {
                         engine,
                         log: engines_log.clone(),
+                        state: RegisterState::new(),
                     })),
                 }),
                 ..GpuConfig::new(console)
@@ -1200,6 +1210,8 @@ fn wait_for_idle_and_reference_count_run_in_order() {
 mod masm {
     pub const ADD: u8 = 0;
     pub const EXTENDED: u8 = 7;
+    pub const STATE: u8 = 22;
+    pub const BEQ: u8 = 29;
     pub const ZERO: u8 = 24;
     pub const IMM: u8 = 25;
     pub const LOAD0: u8 = 28;
@@ -1288,6 +1300,42 @@ mod masm {
         .collect()
     }
 
+    pub fn branch_imm(when: bool, offset: i32) -> u16 {
+        (u16::from(when) << 15) | (offset as u16 & 0x1FFF)
+    }
+
+    /// Reads one word at the address in parameters 0 (high) and 1 (low) and sends 1 to method
+    /// 0xc00 when it is zero, else 2.
+    pub fn branch_on_read_program() -> Vec<u32> {
+        [
+            inst(imm(0x1154), nop())
+                .out0(IMM0, OUT_LOAD0)
+                .out1(NONE, OUT_LOAD1),
+            inst(imm(0x0158), imm(1)).out0(IMM0, IMM1),
+            inst(alu(EXTENDED, ZERO, IMM, IMM, 0x1000), imm(0x0c00)).out1(IMM1, NONE),
+            inst(alu(BEQ, ZERO, LOAD0, ZERO, branch_imm(true, 3)), nop()),
+            inst(imm(2), nop()).out0(NONE, IMM0).end(),
+            inst(nop(), nop()),
+            inst(imm(1), nop()).out0(NONE, IMM0).end(),
+            inst(nop(), nop()),
+        ]
+        .iter()
+        .flat_map(Inst::encode)
+        .collect()
+    }
+
+    /// Sends register 0xc00 to method 0xb00.
+    pub fn copy_program() -> Vec<u32> {
+        [
+            inst(alu(STATE, 0, IMM, ZERO, 0xc00), imm(0xb00)).out0(IMM1, NONE),
+            inst(alu(ADD, 1, 0, ZERO, 0), nop()).out0(NONE, ALU0).end(),
+            inst(nop(), nop()),
+        ]
+        .iter()
+        .flat_map(Inst::encode)
+        .collect()
+    }
+
     /// Reads `count` words at the address in parameters 0 (high) and 1 (low) through
     /// MME_DMA_READ_FIFOED and sends them to methods 0xc00...
     pub fn dma_read_program(count: u16) -> Vec<u32> {
@@ -1337,6 +1385,124 @@ fn mme_dma_read_sees_a_preceding_back_write() {
             ],
             "{threading:?}"
         );
+    });
+}
+
+#[test]
+fn mme_dma_reads_run_on_the_back_and_the_front_fetches_what_they_wrote() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let data = 0x24_0000;
+        let read = crate::macros::MACRO_METHOD_BASE;
+        let copy = read + 2;
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .load_macro(0, &masm::dma_read_program(2))
+            .inc(0, crate::macros::LOAD_MME_INSTRUCTION_RAM_POINTER, &[0x100])
+            .non_inc(
+                0,
+                crate::macros::LOAD_MME_INSTRUCTION_RAM,
+                &masm::copy_program(),
+            )
+            .inc(
+                0,
+                crate::macros::LOAD_MME_START_ADDRESS_RAM_POINTER,
+                &[1, 0x100],
+            )
+            .upload(data, &[0x11, 0x22])
+            .once(0, read, &[0, data as u32])
+            .upload(data, &[0x33, 0x44])
+            .once(0, read, &[0, data as u32])
+            .once(0, copy, &[0])
+            .upload(data, &[0x55, 0x66])
+            .once(0, read, &[0, data as u32])
+            .inc(0, 0xc00, &[0x33]);
+        rig.submit(channel, &words.0);
+        let all = rig.methods();
+        let address_writes = all.iter().filter(|m| m.2 == 0x154).count();
+        assert_eq!(
+            address_writes, 2,
+            "the later calls run on the back: {threading:?}"
+        );
+        let methods: Vec<_> = all
+            .into_iter()
+            .filter(|&(_, _, method, _)| method == 0xb00 || method >= 0xc00)
+            .map(|(_, _, method, argument)| (method, argument))
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                (0xc00, 0x11),
+                (0xc01, 0x22),
+                (0xc00, 0x33),
+                (0xc01, 0x44),
+                (0xb00, 0x33),
+                (0xc00, 0x55),
+                (0xc01, 0x66),
+                (0xc00, 0x33),
+            ],
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
+fn a_register_stays_the_backs_until_a_write_sets_its_shadow_copy() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let data = 0x24_0000;
+        let read = crate::macros::MACRO_METHOD_BASE;
+        let shadow_ram_control = reg_index!(Regs, shadow_ram_control);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .load_macro(0, &masm::dma_read_program(2))
+            .upload(data, &[0x11, 0x22])
+            .once(0, read, &[0, data as u32])
+            .upload(data, &[0x33, 0x44])
+            .once(0, read, &[0, data as u32])
+            .inc(0, shadow_ram_control, &[2])
+            .inc(0, 0xc00, &[0x11])
+            .inc(0, shadow_ram_control, &[3])
+            .inc(0, 0xc00, &[0x99]);
+        rig.submit(channel, &words.0);
+        let writes: Vec<_> = rig
+            .methods()
+            .into_iter()
+            .filter(|&(_, _, method, _)| method == 0xc00)
+            .map(|(_, _, _, argument)| argument)
+            .collect();
+        assert_eq!(writes, [0x11, 0x33, 0x11, 0x99], "{threading:?}");
+    });
+}
+
+#[test]
+fn mme_dma_reads_that_branch_on_the_words_run_on_the_back() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let data = 0x24_0000;
+        let read = crate::macros::MACRO_METHOD_BASE;
+        let mut words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .load_macro(0, &masm::branch_on_read_program());
+        for word in [5, 0, 5] {
+            words = words.upload(data, &[word]).once(0, read, &[0, data as u32]);
+        }
+        rig.submit(channel, &words.0);
+        let all = rig.methods();
+        let address_writes = all.iter().filter(|m| m.2 == 0x154).count();
+        assert_eq!(
+            address_writes, 2,
+            "the later calls run on the back: {threading:?}"
+        );
+        let writes: Vec<_> = all
+            .into_iter()
+            .filter(|&(_, _, method, _)| method == 0xc00)
+            .map(|(_, _, _, argument)| argument)
+            .collect();
+        assert_eq!(writes, [2, 1, 2], "{threading:?}");
     });
 }
 
