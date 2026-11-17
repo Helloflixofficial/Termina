@@ -12,7 +12,8 @@ use parking_lot::{Condvar, Mutex};
 use crate::activity::Wait;
 use crate::backend::{
     ChannelId, ComputeContext, DrawParams, FenceAction, FramebufferConfig, GpuHandles,
-    GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
+    GpuPredicate, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
+    RenderCondition,
 };
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
 use crate::clock::{GpuClockSpeed, GuestTime};
@@ -83,6 +84,11 @@ enum Event {
         grid: [u32; 3],
         indirect_grid: Option<u64>,
     },
+    /// A macro the back ran wrote RENDER_ENABLE_MODE as a condition the renderer tests.
+    RenderCondition {
+        mode: u32,
+        condition: RenderCondition,
+    },
 }
 
 /// Engines a rig binds: recording ones that log every method, or the real ones.
@@ -132,6 +138,17 @@ impl Engine for RecordingEngine {
     fn graphics_state(&self) -> Option<&RegisterState> {
         (self.engine == EngineKind::Maxwell3d).then_some(&self.state)
     }
+
+    fn set_render_condition(
+        &mut self,
+        _ctx: &mut EngineContext<'_>,
+        mode: u32,
+        condition: RenderCondition,
+    ) {
+        self.log
+            .lock()
+            .push(Event::RenderCondition { mode, condition });
+    }
 }
 
 /// When the recording renderer's host GPU completes work.
@@ -159,6 +176,9 @@ struct HostWork {
     pending: Mutex<(Vec<Pending>, usize)>,
     /// How often the GPU asked whether fences are pending.
     fence_polls: AtomicUsize,
+    /// The device address of a SamplesPassed report the host GPU has yet to write, which the
+    /// renderer offers as predicate 0x77.
+    samples: Mutex<Option<u64>>,
 }
 
 impl HostWork {
@@ -289,6 +309,14 @@ impl Rasterizer for Recorder {
         size: u64,
         put: &mut dyn FnMut(u64, u32),
     ) -> bool {
+        if self
+            .work
+            .samples
+            .lock()
+            .is_some_and(|samples| samples < addr + size && addr < samples + 16)
+        {
+            return false;
+        }
         let timestamp = self.work.handles.timestamp.now();
         for work in &self.work.pending.lock().0 {
             match *work {
@@ -320,6 +348,9 @@ impl Rasterizer for Recorder {
             }
         }
         true
+    }
+    fn samples_predicate(&mut self, _channel: ChannelId, addr: u64) -> Option<GpuPredicate> {
+        (*self.work.samples.lock() == Some(addr)).then_some(GpuPredicate(0x77))
     }
     fn has_pending_fences(&self) -> bool {
         self.work.fence_polls.fetch_add(1, Ordering::Relaxed);
@@ -441,6 +472,7 @@ impl Rig {
                     memory: memory.clone(),
                     pending: Mutex::default(),
                     fence_polls: AtomicUsize::new(0),
+                    samples: Mutex::new(None),
                 });
                 work = Some(host.clone());
                 Box::new(Recorder {
@@ -1210,6 +1242,8 @@ fn wait_for_idle_and_reference_count_run_in_order() {
 mod masm {
     pub const ADD: u8 = 0;
     pub const EXTENDED: u8 = 7;
+    pub const OR: u8 = 14;
+    pub const XOR: u8 = 15;
     pub const STATE: u8 = 22;
     pub const BEQ: u8 = 29;
     pub const ZERO: u8 = 24;
@@ -1317,6 +1351,55 @@ mod masm {
             inst(imm(2), nop()).out0(NONE, IMM0).end(),
             inst(nop(), nop()),
             inst(imm(1), nop()).out0(NONE, IMM0).end(),
+            inst(nop(), nop()),
+        ]
+        .iter()
+        .flat_map(Inst::encode)
+        .collect()
+    }
+
+    /// Reads the six words of an occlusion report at the address in parameters 0 (high) and 1
+    /// (low) and sends RENDER_ENABLE_MODE 0 when the 64-bit count in words 0 and 1 equals the
+    /// value in words 4 and 5, else 1.
+    pub fn occlusion_program() -> Vec<u32> {
+        [
+            inst(imm(0x1154), nop())
+                .out0(IMM0, OUT_LOAD0)
+                .out1(NONE, OUT_LOAD1),
+            inst(imm(0x0158), imm(6)).out0(IMM0, IMM1),
+            inst(alu(EXTENDED, ZERO, IMM, IMM, 0x1000), imm(0x0556)).out1(IMM1, NONE),
+            inst(alu(ADD, 1, LOAD0, ZERO, 0), alu(ADD, 0, LOAD1, ZERO, 0)),
+            inst(alu(ADD, ZERO, LOAD0, LOAD1, 0), nop()),
+            inst(alu(XOR, 1, 1, LOAD0, 0), alu(XOR, 0, 0, LOAD1, 0)),
+            inst(alu(OR, 1, 1, 0, 0), nop()),
+            inst(alu(BEQ, ZERO, 1, ZERO, branch_imm(true, 3)), nop()),
+            inst(imm(1), nop()).out0(NONE, IMM0).end(),
+            inst(nop(), nop()),
+            inst(imm(0), nop()).out0(NONE, IMM0).end(),
+            inst(nop(), nop()),
+        ]
+        .iter()
+        .flat_map(Inst::encode)
+        .collect()
+    }
+
+    /// [`occlusion_program`], but each way writes RENDER_ENABLE_MODE twice: 0 then 1 when the
+    /// count equals words 4 and 5, else 1 then 0.
+    pub fn swapping_occlusion_program() -> Vec<u32> {
+        [
+            inst(imm(0x1154), nop())
+                .out0(IMM0, OUT_LOAD0)
+                .out1(NONE, OUT_LOAD1),
+            inst(imm(0x0158), imm(6)).out0(IMM0, IMM1),
+            inst(alu(EXTENDED, ZERO, IMM, IMM, 0x1000), imm(0x0556)).out1(IMM1, NONE),
+            inst(alu(ADD, 1, LOAD0, ZERO, 0), alu(ADD, 0, LOAD1, ZERO, 0)),
+            inst(alu(ADD, ZERO, LOAD0, LOAD1, 0), nop()),
+            inst(alu(XOR, 1, 1, LOAD0, 0), alu(XOR, 0, 0, LOAD1, 0)),
+            inst(alu(OR, 1, 1, 0, 0), nop()),
+            inst(alu(BEQ, ZERO, 1, ZERO, branch_imm(true, 3)), nop()),
+            inst(imm(1), imm(0)).out0(NONE, IMM0).out1(NONE, IMM1).end(),
+            inst(nop(), nop()),
+            inst(imm(0), imm(1)).out0(NONE, IMM0).out1(NONE, IMM1).end(),
             inst(nop(), nop()),
         ]
         .iter()
@@ -2714,4 +2797,90 @@ fn a_cpu_read_after_shutdown_returns_without_the_back() {
         assert_eq!(rig.cpu_read(GPU_WRITTEN), 0, "{threading:?}");
         assert!(rig.cpu_reads().is_empty());
     });
+}
+
+/// The RENDER_ENABLE_MODE writes and render conditions of a rig's 3D engine, in order.
+fn render_enables(rig: &Rig) -> Vec<(u32, Option<bool>)> {
+    rig.events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Method {
+                engine: EngineKind::Maxwell3d,
+                method: 0x556,
+                argument,
+                ..
+            } => Some((argument, None)),
+            Event::RenderCondition { mode, condition } => {
+                assert_eq!(condition.predicate, GpuPredicate(0x77));
+                Some((mode, Some(condition.inverted)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn occlusion_rig(compare: [u32; 2], pending: bool) -> Rig {
+    occlusion_rig_with(&masm::occlusion_program(), compare, pending)
+}
+
+fn occlusion_rig_with(program: &[u32], compare: [u32; 2], pending: bool) -> Rig {
+    let rig = Rig::new(Threading::Split);
+    let report = 0x24_0000;
+    let channel = rig.channel(HostClass::Ampere);
+    let mut words = Pushbuffer::default()
+        .bind(0, AMPERE_3D)
+        .load_macro(0, program)
+        .upload(report, &[3, 0, 0x1234, 0, compare[0], compare[1]]);
+    for _ in 0..3 {
+        words = words.once(0, crate::macros::MACRO_METHOD_BASE, &[0, report as u32]);
+    }
+    if pending {
+        *rig.work.samples.lock() = Some(DEVICE_BASE + report);
+    }
+    let mut rig = rig;
+    rig.submit(channel, &words.0);
+    rig
+}
+
+#[test]
+fn occlusion_tests_of_pending_reports_become_gpu_render_conditions() {
+    let rig = occlusion_rig([0, 0], true);
+    assert_eq!(
+        render_enables(&rig),
+        [(1, None), (1, Some(false)), (1, Some(false))]
+    );
+}
+
+#[test]
+fn each_mode_an_occlusion_test_writes_keeps_its_own_polarity() {
+    let rig = occlusion_rig_with(&masm::swapping_occlusion_program(), [0, 0], true);
+    assert_eq!(
+        render_enables(&rig),
+        [
+            (1, None),
+            (0, None),
+            (1, Some(false)),
+            (0, Some(true)),
+            (1, Some(false)),
+            (0, Some(true))
+        ]
+    );
+}
+
+#[test]
+fn occlusion_tests_without_a_pending_report_read_it() {
+    let rig = occlusion_rig([0, 0], false);
+    assert_eq!(render_enables(&rig), [(1, None); 3]);
+}
+
+#[test]
+fn occlusion_tests_against_a_nonzero_count_read_the_report() {
+    let rig = occlusion_rig([3, 0], true);
+    assert!(
+        render_enables(&rig)
+            .iter()
+            .all(|&(_, condition)| condition.is_none()),
+        "{:?}",
+        render_enables(&rig)
+    );
 }

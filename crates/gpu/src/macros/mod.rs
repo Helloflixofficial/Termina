@@ -81,6 +81,82 @@ pub trait MacroHost {
     fn write_unknown(&mut self, _method: u32) -> bool {
         false
     }
+    /// A tracked run's DMA read of `out.len()` words at `gpu_va`: fills the words whose values
+    /// are known without waiting for the GPU, and returns them as a mask (bit n for word n, the
+    /// first 64 only). The default knows none.
+    fn dma_peek(&mut self, _gpu_va: u64, _out: &mut [u32]) -> u64 {
+        0
+    }
+}
+
+/// FIFOed read words a condition run ([`MacroEngine::condition_execute`]) follows.
+const READ_WORDS: usize = 64;
+
+/// Calls in a row at one start address without the shape of a condition after which
+/// [`MacroEngine::may_run_as_condition`] lets only one call in [`CONDITION_RETRY`] there make
+/// condition runs.
+pub const CONDITION_MISS_LIMIT: u32 = 32;
+
+/// One call in this many makes condition runs at a start address past [`CONDITION_MISS_LIMIT`].
+pub const CONDITION_RETRY: u32 = 64;
+
+/// A condition run ([`MacroEngine::condition_execute`]): the call's FIFOed read words are known
+/// where [`MacroHost::dma_peek`] knows them, and the run may test the others once, for whether
+/// they all equal values it compares them with. The run takes that test the way it is told.
+#[derive(Clone)]
+pub struct ReadCondition {
+    registers: [turing::Tag; 24],
+    read_known: u64,
+    read_at: [u64; READ_WORDS],
+    expected: [u32; READ_WORDS],
+    expecting: u64,
+    tested: Option<u64>,
+    differs: bool,
+}
+
+impl ReadCondition {
+    /// A run whose test goes the way it goes when some tested word differs from the value the
+    /// call compares it with (`differs`), or when they all equal theirs.
+    pub fn new(differs: bool) -> Self {
+        Self {
+            registers: [turing::Tag::Known; 24],
+            read_known: 0,
+            read_at: [0; READ_WORDS],
+            expected: [0; READ_WORDS],
+            expecting: 0,
+            tested: None,
+            differs,
+        }
+    }
+
+    /// The words the run's test compared, as their GPU addresses with the values the call
+    /// compared them with; None when the run tested none.
+    pub fn tested(&self) -> Option<impl Iterator<Item = (u64, u32)> + '_> {
+        let words = self.tested?;
+        Some(
+            (0..READ_WORDS)
+                .filter(move |&word| words & (1 << word) != 0)
+                .map(|word| (self.read_at[word], self.expected[word])),
+        )
+    }
+
+    /// The read words a zero test of a value tagged `tag` compares with the values the call
+    /// expects of them, recording those values; None when the value is no such comparison.
+    fn equal_words(&mut self, tag: turing::Tag) -> Option<u64> {
+        match tag {
+            turing::Tag::Equal { words } => Some(words),
+            turing::Tag::Word { word, xor } => {
+                let bit = 1u64 << word;
+                if self.expecting & bit != 0 && self.expected[word as usize] != xor {
+                    return None;
+                }
+                self.expecting |= bit;
+                self.expected[word as usize] = xor;
+                Some(bit)
+            }
+            turing::Tag::Known | turing::Tag::Opaque => None,
+        }
+    }
 }
 
 /// Which values of a shadow run ([`MacroEngine::shadow_execute`]) come from the words its DMA
@@ -310,6 +386,9 @@ pub struct MacroEngine {
     stats: MacroStats,
     /// Start addresses whose calls read guest memory since the code last changed.
     memory_readers: std::collections::HashSet<u32>,
+    /// Calls at each start address in a row, since the code last changed, that did not have the
+    /// shape of a condition, and the calls skipped since the last retry past the limit.
+    condition_misses: std::collections::HashMap<u32, (u32, u32)>,
 }
 
 enum Code {
@@ -336,6 +415,7 @@ impl MacroEngine {
             step_limit: DEFAULT_STEP_LIMIT,
             stats: MacroStats::default(),
             memory_readers: std::collections::HashSet::new(),
+            condition_misses: std::collections::HashMap::new(),
         }
     }
 
@@ -380,6 +460,7 @@ impl MacroEngine {
         if changed {
             self.code_generation += 1;
             self.memory_readers.clear();
+            self.condition_misses.clear();
         }
     }
 
@@ -555,6 +636,76 @@ impl MacroEngine {
             start,
             pc: fault.pc,
         })
+    }
+
+    /// Runs the MME64 macro at `start` as a condition run (`condition`): FIFOed read words come
+    /// from [`MacroHost::dma_peek`], and the one test of the others it may make goes the way
+    /// `condition` says. Every write goes to `host.write_method`. Fails with
+    /// [`MacroErrorKind::DependsOnRead`] when unknown read words steer the call any other way or
+    /// reach a write, and with [`MacroErrorKind::UsesDataRam`] at the data RAM, which it leaves
+    /// as it was. Nothing is remembered.
+    pub fn condition_execute<H: MacroHost>(
+        &mut self,
+        start: u32,
+        parameters: &[u32],
+        data_ram: &mut MacroDataRam,
+        host: &mut H,
+        condition: &mut ReadCondition,
+    ) -> Result<(), MacroError> {
+        let Code::Mme64(code) = &self.code else {
+            return Err(MacroError {
+                kind: MacroErrorKind::DependsOnRead,
+                start,
+                pc: start,
+            });
+        };
+        self.record.begin(false);
+        turing::run(
+            code,
+            start,
+            turing::Io {
+                parameters,
+                load_fifo: &mut self.load_fifo,
+                data_ram,
+                host,
+                record: &mut self.record,
+            },
+            self.step_limit,
+            condition,
+        )
+        .map_err(|fault| MacroError {
+            kind: fault.kind,
+            start,
+            pc: fault.pc,
+        })
+    }
+
+    /// Whether the call at `start` about to run makes condition runs: after
+    /// [`CONDITION_MISS_LIMIT`] calls in a row there did not have the shape of a condition, only
+    /// one call in [`CONDITION_RETRY`] does, until one has the shape or the code changes.
+    pub fn may_run_as_condition(&mut self, start: u32) -> bool {
+        let Some((misses, skipped)) = self.condition_misses.get_mut(&start) else {
+            return true;
+        };
+        if *misses < CONDITION_MISS_LIMIT {
+            return true;
+        }
+        *skipped += 1;
+        if *skipped < CONDITION_RETRY {
+            return false;
+        }
+        *skipped = 0;
+        true
+    }
+
+    /// Records whether a call at `start` that made condition runs had the shape of a condition.
+    pub fn note_condition_shape(&mut self, start: u32, shaped: bool) {
+        if shaped {
+            self.condition_misses.remove(&start);
+        } else {
+            let (misses, _) = self.condition_misses.entry(start).or_insert((0, 0));
+            *misses = misses.saturating_add(1);
+        }
     }
 
     /// Turns the memo on or off; off forgets every remembered call.
