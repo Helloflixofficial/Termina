@@ -205,6 +205,7 @@ impl KeplerCompute {
     /// Applies a PCAS to the QMD at `address`, then runs every QMD it makes due, following
     /// their dependent links.
     fn schedule(&self, ctx: &mut EngineContext<'_>, address: GpuVAddr, action: PcasAction) {
+        ctx.finish_semaphore_dependency();
         let (mut address, mut action) = (address, action);
         let result = (|| {
             for _ in 0..CHAIN_LIMIT {
@@ -285,6 +286,7 @@ impl KeplerCompute {
     /// The last LOAD_INLINE_QMD_DATA word: the QMD goes to memory at the inline QMD address and
     /// is scheduled there unless it waits for a scheduling PCAS. SEND_PCAS_A keeps its value.
     fn load_inline_qmd(&self, ctx: &mut EngineContext<'_>) {
+        ctx.finish_semaphore_dependency();
         let address = self.regs.inline_qmd_address.address();
         let bytes = bytemuck::bytes_of(&self.regs.inline_qmd);
         if let Err(fault) = ctx.memory.write_block(address, bytes) {

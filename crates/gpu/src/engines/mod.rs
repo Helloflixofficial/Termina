@@ -206,6 +206,21 @@ pub struct EngineContext<'a> {
     pub activity: &'a Activity,
 }
 
+impl EngineContext<'_> {
+    /// Software memory accesses don't run on the GPU queue. Finish any dependency an acquire
+    /// observed there before touching guest RAM directly.
+    pub(crate) fn finish_semaphore_dependency(&mut self) {
+        if self
+            .syncpoints
+            .semaphore_waiters()
+            .has_unpublished_dependency()
+        {
+            let _waiting = self.activity.waiting(crate::activity::Wait::HostGpu);
+            self.rasterizer.release_fences(true);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing;
 
