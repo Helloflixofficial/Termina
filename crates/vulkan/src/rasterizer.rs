@@ -27,9 +27,9 @@ use lichii_common::DAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
-    Blit, BlitOperation, ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig,
-    GpuHandles, GpuPredicate, GraphicsContext, ImageCopy, IndirectDraw, Query, QueryKind,
-    Rasterizer, ReleaseSize, RenderCondition,
+    Blit, BlitOperation, ComputeContext, CpuReadCompleter, CpuReadDone, CpuReadTicket, DrawParams,
+    DrawTexture, FenceAction, FramebufferConfig, GpuHandles, GpuPredicate, GraphicsContext,
+    ImageCopy, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize, RenderCondition,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -1604,6 +1604,56 @@ impl Rasterizer for VulkanRasterizer {
             tracing::error!(%error, "flushing GPU-modified images failed");
         }
         self.texture_cache.rearm(addr, addr.saturating_add(size));
+    }
+
+    fn begin_cpu_read(
+        &mut self,
+        addr: DAddr,
+        size: u64,
+        after: Option<CpuReadTicket>,
+    ) -> CpuReadDone {
+        if crate::debug::device_is_lost() {
+            self.handles.device.disarm_flush_traps(addr, size);
+            return CpuReadDone::Home;
+        }
+        let end = addr.saturating_add(size);
+        let (area, done) =
+            match self
+                .buffer_cache
+                .begin_cpu_read(&mut self.scheduler, addr, size, after)
+            {
+                Ok(begun) => begun,
+                Err(error) => {
+                    tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
+                    ((addr, end), CpuReadDone::Home)
+                }
+            };
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        if let Err(error) = self.texture_cache.flush(&mut tx, addr, size) {
+            tracing::error!(%error, "flushing GPU-modified images failed");
+        }
+        self.buffer_cache.disarm_written_back(addr, end);
+        self.texture_cache.rearm(area.0.min(addr), area.1.max(end));
+        done
+    }
+
+    fn end_cpu_reads(&mut self) {
+        if self.buffer_cache.cpu_reads_wait_for_recording() {
+            self.unflushed = true;
+            self.flush();
+        }
+        if let Err(error) = self.buffer_cache.end_cpu_reads(&self.scheduler) {
+            tracing::error!(%error, "submitting copies for CPU reads failed");
+        }
+    }
+
+    fn cpu_read_completer(&self) -> Option<Arc<dyn CpuReadCompleter>> {
+        self.buffer_cache.cpu_read_completer()
     }
 
     fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
