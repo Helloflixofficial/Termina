@@ -2781,6 +2781,16 @@ impl VulkanRasterizer {
                 removals = self.texture_cache.removals();
             }
         };
+        if (module.hash == 0x28219a3227b04edd || module.hash == 0xd5917834384e5046)
+            && !self.draw.textures.is_empty()
+            && !self.draw.storage_images.is_empty()
+        {
+            let src_id = self.draw.textures[0];
+            let dst_id = self.draw.storage_images[0].0;
+            self.texture_cache
+                .blit_between(&mut self.scheduler, src_id, dst_id)?;
+            return Ok(());
+        }
         let set = self.descriptor_set(template)?;
         let batched = grid.is_none()
             && self.draw.texel_views.is_empty()

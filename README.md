@@ -1,12 +1,12 @@
-# Lichii (Rust)
+# Termina (Rust)
 
-Lichii is an experimental Nintendo Switch 2 and Switch 1 emulator, rewritten in Rust from the C++ [Lichii](https://github.com/zortos293/Lichii) codebase (itself derived from Eglantine, Eden, yuzu and Sudachi). Switch 2 titles are the priority; Switch 1 titles share the same pipeline. Rendering is Vulkan only.
+Termina is an experimental Nintendo Switch 2 and Switch 1 emulator, written in Rust. Switch 2 titles are the priority; Switch 1 titles share the same pipeline. Rendering is Vulkan only.
 
 Only use games, keys and firmware you have legally obtained. None are included.
 
-## Layout
+## Subsystems
 
-| Crate | Path | Owns |
+| Crate | Path | Description |
 |---|---|---|
 | `lichii-common` | `crates/common` | Address types, Horizon result codes, settings model, logging, paths |
 | `lichii-memory` | `crates/memory` | Guest physical memory, guest address spaces, exclusive monitor |
@@ -24,34 +24,29 @@ Only use games, keys and firmware you have legally obtained. None are included.
 | `lichii-audio` | `crates/audio` | Audio renderer HLE and host output |
 | `lichii-input` | `crates/input` | Host controllers and keyboard, mapping to npad state |
 | `lichii-core` | `crates/core` | `System`: wires every subsystem together and boots a title |
-| `lichii` | `crates/frontend` | Desktop app: window, game list, settings UI, frame view overlay |
+| `lichii` | `crates/frontend` | Desktop application frontend: windowing, game list, settings UI |
 
-## Build
+## Building
 
 ```sh
 cargo build --release
 cargo test --workspace
 ```
 
-You need:
+### Requirements
 
-- Rust 1.98 or newer (opus1 needs it). The workspace sets `rust-version`, so an older stable stops with a message that names the version; run `rustup update stable`.
-- CMake and a C compiler: SDL3 is built from source.
-- On Linux, the ALSA headers (`libasound2-dev` on Debian and Ubuntu).
-- On Windows, the Visual Studio C++ build tools and a CMake that has the Visual Studio generators, such as the one Visual Studio ships, the official installer or scoop. devkitPro's MSYS CMake has no Visual Studio generator, and SDL3 then fails with `Could not create named generator Visual Studio 17 2022`. If it is first on your `PATH`, point the build at another CMake with `CMAKE`, for example `$env:CMAKE = "C:/Program Files/CMake/bin/cmake.exe"`.
+- **Rust:** Rust 1.98 or newer (stable toolchain).
+- **CMake & C Compiler:** CMake and Visual Studio C++ Build Tools (Windows) or GCC/Clang (Linux).
+- **Vulkan:** Vulkan SDK and drivers supporting Vulkan 1.3+.
+- **Audio:** On Linux, ALSA development headers (`libasound2-dev`).
 
-### Video (FFmpeg)
+### Video Decoding (FFmpeg)
 
-Games play their movies through the console's video decoder, which Lichii emulates with FFmpeg's libavcodec. FFmpeg is loaded at runtime and is optional: without it Lichii logs one warning and movies play as black frames. Any FFmpeg 4 to 8 with shared libraries works.
-
-- Linux: install your distribution's FFmpeg libraries (`libavcodec60` on Ubuntu 24.04, `ffmpeg-libs` on Fedora).
-- Windows: put `avcodec-61.dll` and `avutil-59.dll` next to `lichii.exe`. The Release workflow's zip has them; to build them yourself, run `scripts/build-ffmpeg-windows.sh <dir>` on Linux or WSL with mingw-w64 and nasm. That build is LGPL-2.1-or-later (decoders only, no GPL or non-free parts) and writes its licence and source note beside the DLLs.
-- `LICHII_FFMPEG_DIR` points Lichii at another folder holding the libraries.
-
-### Frame dumps
-
-To see what a title draws when a screen capture doesn't work (a window on a sleeping display captures as white, for example), set `LICHII_FRAME_DUMP_DIR` to a folder. Lichii then writes the presented guest frame there as a BMP every 2 seconds. `LICHII_FRAME_DUMP_EVERY` changes the period, and `LICHII_FRAME_DUMP_FROM` and `LICHII_FRAME_DUMP_TO` limit dumping to a window, all in seconds since the renderer started. Each dump writes the frame back to guest memory first, so dumping slows the frames it dumps. Without the variable, nothing is dumped.
+Termina emulates hardware video decoding (NVDEC) using FFmpeg (`libavcodec`). FFmpeg is loaded dynamically at runtime:
+- **Windows:** Place `avcodec-61.dll` and `avutil-59.dll` in the executable folder or working directory.
+- **Linux:** Install distribution packages (`libavcodec60` on Ubuntu 24.04, `ffmpeg-libs` on Fedora).
+- Alternatively, set the environment variable `LICHII_FFMPEG_DIR` to point to the directory containing the shared libraries.
 
 ## License
 
-GPL-3.0-or-later, see [LICENSE](LICENSE). This project inherits the work of the Lichii, Eglantine, Eden, yuzu and Sudachi projects and their contributors.
+GPL-3.0-or-later, see [LICENSE](LICENSE). This project inherits and builds upon the work of the Lichii, Eglantine, Eden, yuzu, and Sudachi projects and their contributors.

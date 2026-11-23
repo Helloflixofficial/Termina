@@ -1959,6 +1959,85 @@ impl TextureCache {
         image.image.raw()
     }
 
+    /// Blits from `src_id` to `dst_id` using hardware bilinear scaling.
+    pub(crate) fn blit_between(
+        &mut self,
+        scheduler: &mut Scheduler,
+        src_id: ImageId,
+        dst_id: ImageId,
+    ) -> Result<()> {
+        if src_id == dst_id {
+            return Ok(());
+        }
+        let (src_extent, src_format, src_layers) = {
+            let src = self.image(src_id);
+            let desc = src.image.desc();
+            (desc.extent, desc.format, desc.array_layers)
+        };
+        let (dst_extent, dst_layers) = {
+            let dst = self.image(dst_id);
+            let desc = dst.image.desc();
+            (desc.extent, desc.array_layers)
+        };
+        let cmd = scheduler.record()?;
+        let src_raw = self.prepare_live(cmd, src_id, ImageAccess::TRANSFER_SRC);
+        let dst_raw = self.prepare_live(cmd, dst_id, ImageAccess::TRANSFER_DST);
+        let aspect = aspect_of(src_format);
+        let filter = if self
+            .device
+            .format_features(src_format)
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+        {
+            vk::Filter::LINEAR
+        } else {
+            vk::Filter::NEAREST
+        };
+        let region = vk::ImageBlit {
+            src_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: src_layers.min(dst_layers).max(1),
+            },
+            src_offsets: [
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: src_extent.width as i32,
+                    y: src_extent.height as i32,
+                    z: 1,
+                },
+            ],
+            dst_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: src_layers.min(dst_layers).max(1),
+            },
+            dst_offsets: [
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: dst_extent.width as i32,
+                    y: dst_extent.height as i32,
+                    z: 1,
+                },
+            ],
+        };
+        // SAFETY: both images are transitioned to TRANSFER_SRC and TRANSFER_DST and the blit region is within bounds.
+        unsafe {
+            self.device.raw.cmd_blit_image(
+                cmd,
+                src_raw,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_raw,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+                filter,
+            );
+        }
+        self.mark_modified(dst_id);
+        Ok(())
+    }
+
     /// Marks a cached image as written by the GPU, and its device pages in the written-pages
     /// bitmap. Called when the writing work is recorded.
     pub fn mark_modified(&mut self, id: ImageId) {

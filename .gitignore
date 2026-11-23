@@ -3,3 +3,6 @@
 *.profraw
 /user
 /scratch
+*.log
+*.raw
+*.dump
