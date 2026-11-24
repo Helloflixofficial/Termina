@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::GraphicsSettings;
+use lichii_common::thread::{ThreadPriority, set_current_thread_priority};
 use lichii_shader::{DescriptorKind, ShaderModule, ShaderStage};
 use parking_lot::{Condvar, Mutex};
 
@@ -951,6 +952,7 @@ impl Workers {
                 std::thread::Builder::new()
                     .name(format!("pipeline worker {index}"))
                     .spawn(move || {
+                        set_current_thread_priority(ThreadPriority::BelowNormal);
                         while let Some(job) = queue.next() {
                             job();
                         }
@@ -1031,16 +1033,13 @@ const SAVE_FAILED: u8 = 2;
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Most pipeline worker threads, and so most driver pipeline compiles running at once, each
-/// holding its own driver scratch memory. The library builds fast linking needs jump the queue,
-/// so more workers mostly shorten a cold start, while competing for host threads with the guest
-/// cores, the GPU threads and the shader translation workers (also at most 4).
-const MAX_PIPELINE_WORKERS: usize = 4;
+/// holding its own driver scratch memory.
+const MAX_PIPELINE_WORKERS: usize = 32;
 /// Runs whose pipelines the boot prebuild builds: the last two, so one short run (a boot to the
 /// menu, a crash) does not drop the run before it.
 const PREBUILD_RUNS: u16 = 2;
-/// Most pipelines the boot prebuild queues. The rest build on first use like any miss, from the
-/// driver cache when it holds them.
-const PREBUILD_LIMIT: usize = 256;
+/// Most pipelines the boot prebuild queues. Prebuild all recent pipelines rather than truncating.
+const PREBUILD_LIMIT: usize = 4096;
 /// Runs in a row, the saving one included, a stored key may go unused before a save drops it.
 const KEEP_RUNS: u16 = 8;
 
@@ -3160,7 +3159,7 @@ mod tests {
     fn worker_count_leaves_a_thread_and_stays_within_the_cap() {
         assert_eq!(
             [0, 1, 2, 3, 5, 12, 24, 128].map(worker_count),
-            [1, 1, 1, 2, 4, 4, 4, 4]
+            [1, 1, 1, 2, 4, 11, 23, 32]
         );
     }
 

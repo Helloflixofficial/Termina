@@ -27,10 +27,10 @@ use super::shader_cache::{hash_program, keep_failure_questions, warn_failed};
 use crate::debug::shader_dump;
 
 /// Presents a queued job may go unrequested before workers drop it.
-pub(crate) const STALE_FRAMES: u64 = 2;
-/// Host threads the emulator keeps busy: four guest cores and the GPU front and back threads.
-const EMULATION_THREADS: usize = 6;
-const MAX_WORKERS: usize = 4;
+pub(crate) const STALE_FRAMES: u64 = 120;
+/// Host threads the emulator leaves free: two guest cores, with workers at below-normal priority.
+const EMULATION_THREADS: usize = 2;
+const MAX_WORKERS: usize = 32;
 
 /// One program, or a VertexA and VertexB pair, to translate.
 pub(crate) struct Job {
@@ -106,7 +106,7 @@ impl Workers {
     /// [`MAX_WORKERS`].
     pub(crate) fn new(profile: &Profile, host: &HostTranslateInfo) -> Self {
         let count = std::thread::available_parallelism()
-            .map_or(1, |n| n.get().saturating_sub(EMULATION_THREADS))
+            .map_or(2, |n| n.get().saturating_sub(EMULATION_THREADS))
             .clamp(1, MAX_WORKERS);
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue { jobs: Vec::new() }),
