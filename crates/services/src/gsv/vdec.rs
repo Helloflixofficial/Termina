@@ -54,6 +54,8 @@ const REFUSE_AT: usize = READY_WATERMARK * 3;
 const READY_INTERVAL: Duration = Duration::from_millis(4);
 /// Decoded pictures kept ahead of the images they go into.
 const DECODE_AHEAD: usize = 4;
+/// A frame further than this (us) from the movie clock restarts it: a seek or a loop.
+const MAX_DRIFT: u64 = 1_000_000;
 /// How long the worker waits on a 314 release fence before it looks at its state again: Stop or
 /// Finalize may have taken the image back meanwhile.
 const RELEASE_SLICE: Duration = Duration::from_millis(10);
@@ -94,7 +96,8 @@ pub(super) struct VideoDecoderService {
 
 /// What the service thread and the worker share.
 struct Shared {
-    _clock: Arc<dyn GuestClock>,
+    /// The guest clock, which stands still while emulation is paused: the movie clock runs on it.
+    clock: Arc<dyn GuestClock>,
     syncpoints: Arc<Syncpoints>,
     syncpoint: u32,
     memory: Arc<AddressSpace>,
@@ -158,7 +161,7 @@ struct State {
     free: VecDeque<Option<Handout>>,
     /// Filled images, for 213.
     outputs: VecDeque<Output>,
-    clock: Nx2MovieClock,
+    clock: MovieClock,
     submitted: u64,
     /// The client fetched the ready event (3).
     armed: bool,
@@ -220,6 +223,32 @@ impl State {
         self.clock.reset();
         self.last_decoded_pts = 0;
         self.dropped_in_a_row = 0;
+    }
+}
+
+#[derive(Default)]
+struct MovieClock {
+    anchor: Option<(u64, u64)>,
+    nx2: Nx2MovieClock,
+}
+
+impl MovieClock {
+    fn due(&mut self, now: u64, pts: u64) -> u64 {
+        if let Some((start, base)) = self.anchor
+            && let Some(due) = pts
+                .checked_sub(base)
+                .and_then(|offset| start.checked_add(offset))
+            && due.abs_diff(now) <= MAX_DRIFT
+        {
+            return due;
+        }
+        self.anchor = Some((now, pts));
+        now
+    }
+
+    fn reset(&mut self) {
+        self.anchor = None;
+        self.nx2.reset();
     }
 }
 
@@ -300,7 +329,7 @@ impl VideoDecoderService {
         let syncpoint = nvdrv.allocate_syncpoint();
         tracing::info!("nx2:vdecsvc counts its frames on syncpoint {syncpoint}");
         let shared = Arc::new(Shared {
-            _clock: context.kernel.clock().clone(),
+            clock: context.kernel.clock().clone(),
             syncpoints: context.gpu.host1x().syncpoints.clone(),
             syncpoint,
             memory: context.process.memory().clone(),
@@ -320,7 +349,7 @@ impl VideoDecoderService {
                 reset: false,
                 free: VecDeque::new(),
                 outputs: VecDeque::new(),
-                clock: Nx2MovieClock::default(),
+                clock: MovieClock::default(),
                 submitted: 0,
                 armed: false,
                 running: true,
@@ -374,7 +403,7 @@ impl VideoDecoderService {
                 return UNKNOWN;
             };
             state.registered.insert(image);
-            state.clock.released(host_time_us(), presents);
+            state.clock.nx2.released(host_time_us(), presents);
             state.free.push_back(Some(Handout { image, release }));
             value
         };
@@ -448,7 +477,10 @@ impl VideoDecoderService {
                 return NO_OUTPUT;
             };
             let presents = crate::vi::PRESENT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-            state.clock.acquired(host_time_us(), output.pts, 0, presents);
+            state
+                .clock
+                .nx2
+                .acquired(host_time_us(), output.pts, 0, presents);
             output
         };
         for word in [
@@ -623,6 +655,10 @@ impl Media {
 }
 
 impl Shared {
+    fn now_us(&self) -> u64 {
+        (u128::from(self.clock.ticks()) * 1_000_000 / u128::from(self.clock.frequency())) as u64
+    }
+
     fn increment(&self) {
         let _ = self.syncpoints.host().increment(self.syncpoint);
         if self.syncpoints.guest().increment(self.syncpoint).is_err() {
@@ -760,8 +796,8 @@ impl Shared {
         }
         let now_us = host_time_us();
         let pause_end_us = 0i64;
-        let due = state.clock.due(now_us, pause_end_us);
-        let last_acquired = state.clock.last_acquired_pts();
+        let due = state.clock.nx2.due(now_us, pause_end_us);
+        let last_acquired = state.clock.nx2.last_acquired_pts();
         let client_held = state.client_held_images();
 
         let Some(due_pts) = due else {
@@ -823,6 +859,10 @@ impl Shared {
         let mut release_wait: Option<((u32, u32), Instant)> = None;
         let mut state = self.state.lock();
         while !state.quit {
+            let now = self.now_us();
+            let host_now = Instant::now();
+            let mut wake = None;
+
             if std::mem::take(&mut state.reset) {
                 media.drop_queued();
                 continue;
@@ -833,90 +873,102 @@ impl Shared {
                 continue;
             }
 
-            if !state.decoded.is_empty()
-                && !state.free.is_empty()
+            let front_pts = state.decoded.front().map(|d| d.pts);
+            let handout = state.free.front().copied().flatten();
+            if let Some(pts) = front_pts
+                && let Some(handout) = handout
                 && !self.drop_overtaken_frames(&mut state)
             {
-                state.dropped_in_a_row = 0;
-                let decoded = state.decoded.pop_front().expect("checked above");
-                let handout = state.free.pop_front().flatten().expect("checked above");
-
-                let picture = decoded.frame.is_some();
-                if picture
-                    && let Some((syncpoint, value)) = handout.release
-                    && self.syncpoints.guest().is_reached(syncpoint, value) == Ok(false)
-                {
-                    let key = (handout.image, value);
-                    let since = match release_wait {
-                        Some((waiting, since)) if waiting == key => since,
-                        _ => release_wait.insert((key, Instant::now())).1,
-                    };
-                    if Instant::now().duration_since(since) < RELEASE_LIMIT {
-                        drop(state);
-                        let _ = self
-                            .syncpoints
-                            .guest()
-                            .wait(syncpoint, value, Some(RELEASE_SLICE));
-                        state = self.state.lock();
-                        state.free.push_front(Some(handout));
-                        state.decoded.push_front(decoded);
-                        continue;
-                    }
-                    tracing::warn!(
-                        "nx2:vdecsvc: image {}'s release fence ({syncpoint}, {value}) is still \
-                         pending after {RELEASE_LIMIT:?}; writing it anyway",
-                        handout.image
-                    );
-                }
-
-                let size = (state.width, state.height);
-                let (width, height) = match &decoded.frame {
-                    Some(frame) => {
-                        state.writing = true;
-                        let stops = state.stops;
-                        drop(state);
-                        let size = self.write(&mut media, handout, frame, size);
-                        state = self.state.lock();
-                        state.writing = false;
-                        self.idle.notify_all();
-                        if state.stops != stops {
-                            state.frames.extend(decoded.frame);
+                let due = state.clock.due(now, pts);
+                if due <= now {
+                    let picture = state.decoded.front().is_some_and(|d| d.frame.is_some());
+                    if picture
+                        && let Some((syncpoint, value)) = handout.release
+                        && self.syncpoints.guest().is_reached(syncpoint, value) == Ok(false)
+                    {
+                        let key = (handout.image, value);
+                        let since = match release_wait {
+                            Some((waiting, since)) if waiting == key => since,
+                            _ => release_wait.insert((key, Instant::now())).1,
+                        };
+                        if Instant::now().duration_since(since) < RELEASE_LIMIT {
+                            let stops = state.stops;
+                            drop(state);
+                            let _ = self
+                                .syncpoints
+                                .guest()
+                                .wait(syncpoint, value, Some(RELEASE_SLICE));
+                            state = self.state.lock();
+                            if state.stops != stops {
+                                let frame = state.decoded.pop_front().and_then(|d| d.frame);
+                                state.frames.extend(frame);
+                                continue;
+                            }
                             continue;
                         }
-                        size
+                        tracing::warn!(
+                            "nx2:vdecsvc: image {}'s release fence ({syncpoint}, {value}) is still \
+                             pending after {RELEASE_LIMIT:?}; writing it anyway",
+                            handout.image
+                        );
                     }
-                    None => size,
-                };
-                state.frames.extend(decoded.frame);
-                state.outputs.push_back(Output {
-                    image: handout.image,
-                    width,
-                    height,
-                    pts: decoded.pts,
-                    end: decoded.end,
-                });
-                media.frames_out += 1;
-                if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end {
-                    tracing::info!(
-                        "nx2:vdecsvc frame {} ({width}x{height}, pts {} us{}) in image {}, \
-                         {} decoded, {} late dropped, client holds {} of {} images",
-                        media.frames_out,
-                        decoded.pts,
-                        if decoded.end { ", end of stream" } else { "" },
-                        handout.image,
-                        media.pictures,
-                        state.frames_dropped,
-                        state.client_held_images(),
-                        state.registered.len(),
-                    );
+
+                    let decoded = state.decoded.pop_front().unwrap();
+                    let _ = state.free.pop_front();
+                    state.dropped_in_a_row = 0;
+                    release_wait = None;
+
+                    let size = (state.width, state.height);
+                    let (width, height) = match &decoded.frame {
+                        Some(frame) => {
+                            state.writing = true;
+                            let stops = state.stops;
+                            drop(state);
+                            let size = self.write(&mut media, handout, frame, size);
+                            state = self.state.lock();
+                            state.writing = false;
+                            self.idle.notify_all();
+                            if state.stops != stops {
+                                state.frames.extend(decoded.frame);
+                                continue;
+                            }
+                            size
+                        }
+                        None => size,
+                    };
+                    state.frames.extend(decoded.frame);
+                    state.outputs.push_back(Output {
+                        image: handout.image,
+                        width,
+                        height,
+                        pts: decoded.pts,
+                        end: decoded.end,
+                    });
+                    media.frames_out += 1;
+                    if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end {
+                        tracing::info!(
+                            "nx2:vdecsvc frame {} ({width}x{height}, pts {} us{}) in image {}, \
+                             {} decoded, {} late dropped, client holds {} of {} images",
+                            media.frames_out,
+                            decoded.pts,
+                            if decoded.end { ", end of stream" } else { "" },
+                            handout.image,
+                            media.pictures,
+                            state.frames_dropped,
+                            state.client_held_images(),
+                            state.registered.len(),
+                        );
+                    }
+                    if decoded.end {
+                        state.stream_ended = true;
+                        state.end_queued = false;
+                        state.clock.reset();
+                    }
+                    self.increment();
+                    continue;
+                } else {
+                    wake = Some(host_now + Duration::from_micros(due - now));
                 }
-                if decoded.end {
-                    state.stream_ended = true;
-                    state.end_queued = false;
-                    state.clock.reset();
-                }
-                self.increment();
-                continue;
             }
 
             if state.decoded.len() < DECODE_AHEAD
@@ -944,10 +996,10 @@ impl Shared {
                 continue;
             }
 
-            let mut wake = None;
             if state.armed && state.running && state.has_room() {
                 self.ready.signal();
-                wake = Some(Instant::now() + READY_INTERVAL);
+                let next = host_now + READY_INTERVAL;
+                wake = Some(wake.map_or(next, |due: Instant| due.min(next)));
             }
 
             match wake {

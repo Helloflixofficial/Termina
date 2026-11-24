@@ -58,7 +58,12 @@ const DEFAULT_SUBCHANNELS: [(usize, EngineKind, u32); 1] =
 const CONST_BUFFER_DATA: u32 = reg_index!(Regs, const_buffer.buffer);
 const CONST_BUFFER_OFFSET: usize = reg_index!(Regs, const_buffer.offset) as usize;
 const FALCON_4: u32 = reg_index!(Regs, falcon) + 4;
+const COMPUTE_EXEC_UPLOAD: u32 = reg_index!(ComputeRegs, exec_upload);
 const COMPUTE_DATA_UPLOAD: u32 = reg_index!(ComputeRegs, data_upload);
+const COMPUTE_LAUNCH: u32 = reg_index!(ComputeRegs, launch);
+const COMPUTE_SEND_SIGNALING_PCAS2_B: u32 = reg_index!(ComputeRegs, send_signaling_pcas2_b);
+const COMPUTE_LOAD_INLINE_QMD_LAST: u32 = reg_index!(ComputeRegs, inline_qmd) + 63;
+const COMPUTE_REPORT_SEMAPHORE_D: u32 = reg_index!(ComputeRegs, report_semaphore.control);
 const SHADOW_SCRATCH_0: usize = reg_index!(Regs, shadow_scratch) as usize;
 const SHADOW_RAM_CONTROL: u32 = reg_index!(Regs, shadow_ram_control);
 
@@ -1228,8 +1233,24 @@ fn mirror_graphics(state: &mut RegisterState, method: u32, argument: u32) -> boo
 }
 
 #[inline]
+fn is_compute_executable(method: u32) -> bool {
+    matches!(
+        method,
+        COMPUTE_EXEC_UPLOAD
+            | COMPUTE_DATA_UPLOAD
+            | COMPUTE_LAUNCH
+            | COMPUTE_SEND_SIGNALING_PCAS2_B
+            | COMPUTE_LOAD_INLINE_QMD_LAST
+            | COMPUTE_REPORT_SEMAPHORE_D
+    )
+}
+
+#[inline]
 fn send_compute(registers: &mut [u32], stream: &mut Stream, method: u32, argument: u32) {
     if let Some(register) = registers.get_mut(method as usize) {
+        if *register == argument && !is_compute_executable(method) {
+            return;
+        }
         *register = argument;
     }
     stream.engine_word(EngineKind::Compute, method, argument);

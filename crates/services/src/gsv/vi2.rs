@@ -96,9 +96,16 @@ fn spawn_vsync(native: &Arc<NativeEvents>) {
             let mut period = Duration::from_nanos(1_000_000_000 / u64::from(DEFAULT_REFRESH_HZ));
             loop {
                 next += period;
-                match next.checked_duration_since(Instant::now()) {
-                    Some(wait) => std::thread::sleep(wait),
-                    None => next = Instant::now(),
+                let now = Instant::now();
+                if let Some(wait) = next.checked_duration_since(now) {
+                    if wait > Duration::from_millis(2) {
+                        std::thread::sleep(wait - Duration::from_millis(1));
+                    }
+                    while Instant::now() < next {
+                        std::hint::spin_loop();
+                    }
+                } else if now > next + period {
+                    next = now;
                 }
                 let Some(native) = weak.upgrade() else { return };
                 native.vblank();
@@ -248,14 +255,15 @@ impl Vi2 {
         }
         if let Some((id, value)) = presents.previous_fence.replace(fence) {
             let guest = self.context.gpu.host1x().syncpoints.guest();
-            if let Err(err @ SyncpointWaitError::TimedOut { .. }) =
-                crate::context::wait_guest_syncpoint(
-                    &self.context.kernel,
-                    guest,
-                    id,
-                    value,
-                    Some(FENCE_TIMEOUT),
-                )
+            if guest.is_reached(id, value) != Ok(true)
+                && let Err(err @ SyncpointWaitError::TimedOut { .. }) =
+                    crate::context::wait_guest_syncpoint(
+                        &self.context.kernel,
+                        guest,
+                        id,
+                        value,
+                        Some(FENCE_TIMEOUT),
+                    )
                 && presents.timeouts < 16
             {
                 presents.timeouts += 1;
@@ -341,22 +349,25 @@ impl Vi2 {
     }
 }
 
-/// Sleeps until the next frame is due. A title that fell more than a frame behind starts over
-/// from now instead of rushing to catch up.
+/// Paces presents to `interval` (matching C++ Nx2PresentPacer). A present arriving past its
+/// deadline re-anchors to now so late frames never pile up delays or double-sleep with vsync.
 fn pace(presents: &mut Presents, interval: Option<Duration>) {
     let Some(interval) = interval else {
         presents.deadline = None;
         return;
     };
     let now = Instant::now();
-    let deadline = presents
-        .deadline
-        .map(|last| last + interval)
-        .filter(|&next| next + interval >= now)
-        .unwrap_or(now);
-    presents.deadline = Some(deadline);
-    if let Some(wait) = deadline.checked_duration_since(now) {
-        std::thread::sleep(wait);
+    let deadline = presents.deadline.map_or(now, |last| last + interval);
+    let reset = presents.deadline.is_none() || now > deadline + interval;
+    let target = if reset { now } else { deadline };
+    presents.deadline = Some(target);
+    if let Some(wait) = target.checked_duration_since(now) {
+        if wait > Duration::from_millis(2) {
+            std::thread::sleep(wait - Duration::from_millis(1));
+        }
+        while Instant::now() < target {
+            std::hint::spin_loop();
+        }
     }
 }
 

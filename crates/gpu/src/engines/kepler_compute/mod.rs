@@ -114,6 +114,19 @@ impl KeplerCompute {
             return;
         };
         *word = argument;
+        if self.version == QmdVersion::V3
+            && !matches!(
+                method,
+                LAUNCH
+                    | SEND_SIGNALING_PCAS2_B
+                    | LOAD_INLINE_QMD_LAST
+                    | SET_REPORT_SEMAPHORE_D
+                    | EXEC_UPLOAD
+                    | DATA_UPLOAD
+            )
+        {
+            return;
+        }
         match (self.version, method) {
             (_, EXEC_UPLOAD) => {
                 if self.version == QmdVersion::V2 {
