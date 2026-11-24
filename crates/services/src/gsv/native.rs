@@ -227,6 +227,8 @@ struct Image {
     gpu_read: bool,
     /// A decoder image holding a frame written pitch-linear, before its first 426/428.
     pitch_frame: bool,
+    /// A window alias image pool (gsv 315 / 314).
+    window_pool: bool,
 }
 
 /// A native image vi2 can show.
@@ -317,6 +319,7 @@ impl NativeObjects {
                 decoder: false,
                 gpu_read: false,
                 pitch_frame: false,
+                window_pool: false,
             },
         );
         (objects, 1)
@@ -398,6 +401,7 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
                 decoder,
                 gpu_read: false,
                 pitch_frame: false,
+                window_pool: false,
             };
             if decoder {
                 for i in 0..count {
@@ -418,6 +422,19 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
                 preference[6]
             );
             ctx.push(id);
+        }
+        314 | 315 => {
+            let id = words.u32(2);
+            let create = command == 315;
+            let mut objects = objects.lock();
+            if let Some(image) = objects.images.get_mut(&id) {
+                image.window_pool = create;
+            }
+            tracing::info!("nx2:gsv {command} window image pool image {id}");
+        }
+        427 => {
+            let handle = words.u32(2);
+            tracing::debug!("nx2:gsv 427 image {handle}");
         }
         430 | 912 => {
             objects.lock().images.remove(&words.u32(2));

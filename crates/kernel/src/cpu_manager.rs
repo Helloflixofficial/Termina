@@ -142,6 +142,13 @@ impl Core {
                         process = thread.process().name(),
                         thread = thread.id(),
                         lr = format_args!("{:#x}", self.ctx.x[30]),
+                        sp = format_args!("{:#x}", self.ctx.sp),
+                        pc = format_args!("{:#x}", self.ctx.pc),
+                        x0 = format_args!("{:#x}", self.ctx.x[0]),
+                        x1 = format_args!("{:#x}", self.ctx.x[1]),
+                        x2 = format_args!("{:#x}", self.ctx.x[2]),
+                        x19 = format_args!("{:#x}", self.ctx.x[19]),
+                        x26 = format_args!("{:#x}", self.ctx.x[26]),
                         "unhandled guest fault: {fault:?}"
                     );
                     self.kernel.terminate_process(thread.process());

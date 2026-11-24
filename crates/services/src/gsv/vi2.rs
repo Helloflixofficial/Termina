@@ -431,6 +431,27 @@ impl Service for Vi2 {
                 self.bind(ctx, command);
                 ResultCode::SUCCESS
             }
+            13
+            | 51
+            | 101
+            | 102
+            | 107
+            | 108
+            | 111
+            | 112
+            | 113
+            | 201
+            | 202
+            | 230
+            | 231
+            | 232
+            | 251
+            | 252
+            | 301
+            | 302
+            | 351..=356
+            | 358
+            | 359 => ResultCode::SUCCESS,
             _ => return None,
         })
     }

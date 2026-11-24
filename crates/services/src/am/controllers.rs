@@ -266,6 +266,7 @@ impl Service for SelfController {
             240 => ResultCode::SUCCESS,
             1000 => push_nx2_stub(&self.context, ctx, "ISelfController"),
             2000 => crate::gsv::open(&self.context, ctx),
+            2400 => ResultCode::SUCCESS,
             _ => return None,
         })
     }

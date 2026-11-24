@@ -129,7 +129,7 @@ impl Service for GraphicsSystem {
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         let context = &self.context;
         Some(match ctx.command() {
-            4 | 5 | 101 | 601 | 901 | 1001 | 1201 => ResultCode::SUCCESS,
+            4 | 5 | 101 | 601 | 901 | 903 | 1001 | 1201 => ResultCode::SUCCESS,
             11 => {
                 let mut state = self.state.lock();
                 if std::mem::replace(&mut state.client_handle_registered, true) {
@@ -162,8 +162,8 @@ impl Service for GraphicsSystem {
             ),
             497 => push_session(context, ctx, gpu::GpuSession::new(context)),
             1402 => open_nvsrv(context, ctx),
-            111 | 112 | 114 | 423 | 426 | 428 | 429 | 430 | 435 | 911 | 912 | 961 | 991 | 1211
-            | 1291 | 1510 => native::handle(&self.objects, ctx),
+            111 | 112 | 114 | 314 | 315 | 423 | 426 | 427 | 428 | 429 | 430 | 435 | 911 | 912
+            | 961 | 991 | 1211 | 1291 | 1510 => native::handle(&self.objects, ctx),
             434 => {
                 let id: u32 = ctx.pop();
                 self.state.lock().address_spaces.insert(id);

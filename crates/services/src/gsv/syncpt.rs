@@ -375,6 +375,7 @@ impl Service for SyncptSession {
                 ctx.push(32u32);
                 ResultCode::SUCCESS
             }
+            21 => ResultCode::SUCCESS,
             22 => {
                 let slot: u32 = ctx.pop();
                 let event = self.slot_event(slot);
