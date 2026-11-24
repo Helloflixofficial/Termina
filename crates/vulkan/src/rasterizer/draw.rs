@@ -2781,6 +2781,9 @@ impl VulkanRasterizer {
                 removals = self.texture_cache.removals();
             }
         };
+        if module.hash == 0xb0801807662375d7 {
+            return Ok(());
+        }
         if (module.hash == 0x28219a3227b04edd || module.hash == 0xd5917834384e5046)
             && !self.draw.textures.is_empty()
             && !self.draw.storage_images.is_empty()

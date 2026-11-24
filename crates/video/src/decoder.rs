@@ -148,6 +148,8 @@ impl Decoder {
             (api.av_opt_set)(context, c"thread_type".as_ptr(), thread_type.as_ptr(), 0);
             if latency == Latency::Immediate {
                 (api.av_opt_set)(context, c"flags".as_ptr(), c"+low_delay".as_ptr(), 0);
+                (api.av_opt_set)(context, c"flags2".as_ptr(), c"+fast".as_ptr(), 0);
+                (api.av_opt_set)(context, c"tune".as_ptr(), c"zerolatency".as_ptr(), 0);
             }
             check((api.avcodec_open2)(decoder.context, found, ptr::null_mut()))?;
             Ok(decoder)

@@ -282,6 +282,7 @@ impl Vi {
 
     /// Shows `item` once its fence is reached; `presented` gives its buffer back after that.
     fn flip(&self, item: &Item, presented: impl FnOnce() + Send + 'static) {
+        PRESENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let buffer = &item.buffer;
         let format = match buffer.external_format {
             4 => PixelFormat::R5G6B5Unorm,
@@ -328,6 +329,9 @@ impl Vi {
         );
     }
 }
+
+/// Present count tracking for synchronization with video clock and paced presentation.
+pub static PRESENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Starts the host thread that ticks at the vblank rate while `vi` lives.
 fn spawn_compositor(vi: &Arc<Vi>) {

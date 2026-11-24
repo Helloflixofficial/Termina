@@ -52,8 +52,6 @@ const REFUSE_AT: usize = READY_WATERMARK * 3;
 /// The client clears the ready event after each wait, so while there is room it is signalled
 /// again this often.
 const READY_INTERVAL: Duration = Duration::from_millis(4);
-/// A frame further than this (us) from the movie clock restarts it: a seek or a loop.
-const MAX_DRIFT: u64 = 1_000_000;
 /// Decoded pictures kept ahead of the images they go into.
 const DECODE_AHEAD: usize = 4;
 /// How long the worker waits on a 314 release fence before it looks at its state again: Stop or
@@ -96,8 +94,7 @@ pub(super) struct VideoDecoderService {
 
 /// What the service thread and the worker share.
 struct Shared {
-    /// The guest clock, which stands still while emulation is paused: the movie clock runs on it.
-    clock: Arc<dyn GuestClock>,
+    _clock: Arc<dyn GuestClock>,
     syncpoints: Arc<Syncpoints>,
     syncpoint: u32,
     memory: Arc<AddressSpace>,
@@ -161,7 +158,7 @@ struct State {
     free: VecDeque<Option<Handout>>,
     /// Filled images, for 213.
     outputs: VecDeque<Output>,
-    clock: MovieClock,
+    clock: Nx2MovieClock,
     submitted: u64,
     /// The client fetched the ready event (3).
     armed: bool,
@@ -175,11 +172,21 @@ struct State {
     /// Stops and Finalizes so far: a write that sees this change took an image they completed.
     stops: u64,
     quit: bool,
+    registered: std::collections::BTreeSet<u32>,
+    frames_dropped: u64,
+    dropped_in_a_row: usize,
+    frame_interval: u64,
+    last_decoded_pts: u64,
 }
 
 impl State {
     fn has_room(&self) -> bool {
         !self.stream_ended && !self.end_queued && self.inputs.len() < READY_WATERMARK
+    }
+
+    fn client_held_images(&self) -> usize {
+        let ours = self.free.len() + self.outputs.len();
+        self.registered.len().saturating_sub(ours)
     }
 
     /// Queues `input`; false when the queue is full.
@@ -210,30 +217,73 @@ impl State {
         self.reset = true;
         self.stream_ended = false;
         self.end_queued = false;
-        self.clock = MovieClock::default();
+        self.clock.reset();
+        self.last_decoded_pts = 0;
+        self.dropped_in_a_row = 0;
     }
 }
 
-/// Maps a stream's pts to guest time (us). It is anchored at the first frame after a reset, so the
-/// frames come out at their pts pace, and stands still while emulation is paused, as the movie's
-/// audio does.
+/// The clock a video decoder session (`nx2:vdecsvc`) drops late frames by: the pts the movie's
+/// audio has reached. Times are host microseconds; pause_end is when emulation last resumed.
 #[derive(Default)]
-struct MovieClock(Option<(u64, u64)>);
+struct Nx2MovieClock {
+    /// Host time minus pts of the frame the clock started from.
+    offset: Option<i64>,
+    last_acquire: i64,
+    last_acquired_pts: u64,
+    last_acquire_presents: u64,
+}
 
-impl MovieClock {
-    /// When the frame at `pts` is due, in guest us.
-    fn due(&mut self, now: u64, pts: u64) -> u64 {
-        if let Some((start, base)) = self.0
-            && let Some(due) = pts
-                .checked_sub(base)
-                .and_then(|offset| start.checked_add(offset))
-            && due.abs_diff(now) <= MAX_DRIFT
-        {
-            return due;
-        }
-        self.0 = Some((now, pts));
-        now
+impl Nx2MovieClock {
+    const PAUSE_GAP: i64 = 1_000_000;
+    const MAX_CATCH_UP: i64 = 3_000_000;
+    const PACED_PRESENTS: u64 = 2;
+
+    fn reset(&mut self) {
+        self.offset = None;
     }
+
+    fn acquired(&mut self, now: i64, pts: u64, pause_end: i64, presents: u64) {
+        let acquired_offset = now - pts as i64;
+        if self.offset.is_none()
+            || now - self.last_acquire > Self::PAUSE_GAP
+            || pause_end > self.last_acquire
+            || pts < self.last_acquired_pts
+            || acquired_offset - self.offset.unwrap_or(0) > Self::MAX_CATCH_UP
+        {
+            self.offset = Some(acquired_offset);
+        }
+        self.last_acquire = now;
+        self.last_acquired_pts = pts;
+        self.last_acquire_presents = presents;
+    }
+
+    fn released(&mut self, now: i64, presents: u64) {
+        if self.offset.is_some()
+            && presents.saturating_sub(self.last_acquire_presents) >= Self::PACED_PRESENTS
+        {
+            self.offset = Some(now - self.last_acquired_pts as i64);
+        }
+    }
+
+    fn due(&self, now: i64, pause_end: i64) -> Option<u64> {
+        let offset = self.offset?;
+        let due = now - offset;
+        if due < 0 || now - self.last_acquire > Self::PAUSE_GAP || pause_end > self.last_acquire {
+            return None;
+        }
+        Some(due as u64)
+    }
+
+    fn last_acquired_pts(&self) -> u64 {
+        self.last_acquired_pts
+    }
+}
+
+fn host_time_us() -> i64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_micros() as i64
 }
 
 impl VideoDecoderService {
@@ -250,7 +300,7 @@ impl VideoDecoderService {
         let syncpoint = nvdrv.allocate_syncpoint();
         tracing::info!("nx2:vdecsvc counts its frames on syncpoint {syncpoint}");
         let shared = Arc::new(Shared {
-            clock: context.kernel.clock().clone(),
+            _clock: context.kernel.clock().clone(),
             syncpoints: context.gpu.host1x().syncpoints.clone(),
             syncpoint,
             memory: context.process.memory().clone(),
@@ -270,7 +320,7 @@ impl VideoDecoderService {
                 reset: false,
                 free: VecDeque::new(),
                 outputs: VecDeque::new(),
-                clock: MovieClock::default(),
+                clock: Nx2MovieClock::default(),
                 submitted: 0,
                 armed: false,
                 running: true,
@@ -279,6 +329,11 @@ impl VideoDecoderService {
                 writing: false,
                 stops: 0,
                 quit: false,
+                registered: std::collections::BTreeSet::new(),
+                frames_dropped: 0,
+                dropped_in_a_row: 0,
+                frame_interval: 16_667,
+                last_decoded_pts: 0,
             }),
             wake: Condvar::new(),
             idle: Condvar::new(),
@@ -312,11 +367,14 @@ impl VideoDecoderService {
             (!counter, value as u32)
         });
         let shared = &self.shared;
+        let presents = crate::vi::PRESENT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         let value = {
             let mut state = shared.state.lock();
             let Ok(value) = shared.syncpoints.increase_max(shared.syncpoint, 1) else {
                 return UNKNOWN;
             };
+            state.registered.insert(image);
+            state.clock.released(host_time_us(), presents);
             state.free.push_back(Some(Handout { image, release }));
             value
         };
@@ -377,15 +435,21 @@ impl VideoDecoderService {
         state.codec = codec;
         state.width = width;
         state.height = height;
-        state.clock = MovieClock::default();
+        state.clock.reset();
         ResultCode::SUCCESS
     }
 
     /// 213: the next filled image (16 words): u32 image, u32 width, u32 height, u32 width,
     /// u32 height, u32 colour space, u64 pts in ns, u32 end of stream.
     fn output_info(&self, ctx: &mut HleRequestContext) -> ResultCode {
-        let Some(output) = self.shared.state.lock().outputs.pop_front() else {
-            return NO_OUTPUT;
+        let output = {
+            let mut state = self.shared.state.lock();
+            let Some(output) = state.outputs.pop_front() else {
+                return NO_OUTPUT;
+            };
+            let presents = crate::vi::PRESENT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            state.clock.acquired(host_time_us(), output.pts, 0, presents);
+            output
         };
         for word in [
             output.image,
@@ -559,10 +623,6 @@ impl Media {
 }
 
 impl Shared {
-    fn now_us(&self) -> u64 {
-        (u128::from(self.clock.ticks()) * 1_000_000 / u128::from(self.clock.frequency())) as u64
-    }
-
     fn increment(&self) {
         let _ = self.syncpoints.host().increment(self.syncpoint);
         if self.syncpoints.guest().increment(self.syncpoint).is_err() {
@@ -686,6 +746,63 @@ impl Shared {
         (width, height)
     }
 
+    const MAX_DROPPED_IN_A_ROW: usize = 30;
+    const MAX_HELD_FOR_PACING: usize = 1;
+
+    /// Games such as Ocarina of Time show one decoded frame per frame they draw and never skip
+    /// one, while the movie's audio plays in real time: below the movie's frame rate the picture
+    /// falls further behind the sound. Drop decoded frames a later frame has already overtaken.
+    /// Returns true when the only frame left is late and more input is queued: decode on before
+    /// filling an image.
+    fn drop_overtaken_frames(&self, state: &mut State) -> bool {
+        if state.decoded.is_empty() {
+            return false;
+        }
+        let now_us = host_time_us();
+        let pause_end_us = 0i64;
+        let due = state.clock.due(now_us, pause_end_us);
+        let last_acquired = state.clock.last_acquired_pts();
+        let client_held = state.client_held_images();
+
+        let Some(due_pts) = due else {
+            state.dropped_in_a_row = 0;
+            return false;
+        };
+
+        if state.decoded.front().is_some_and(|f| f.pts < last_acquired)
+            || client_held > Self::MAX_HELD_FOR_PACING
+        {
+            state.dropped_in_a_row = 0;
+            return false;
+        }
+
+        while state.decoded.len() >= 2 && state.dropped_in_a_row < Self::MAX_DROPPED_IN_A_ROW {
+            let front_pts = state.decoded[0].pts;
+            let front_end = state.decoded[0].end;
+            let front_has_frame = state.decoded[0].frame.is_some();
+            let next_pts = state.decoded[1].pts;
+
+            if front_end || !front_has_frame || next_pts <= front_pts || next_pts > due_pts {
+                break;
+            }
+
+            let dropped = state.decoded.pop_front().unwrap();
+            state.frames.extend(dropped.frame);
+            state.frames_dropped += 1;
+            state.dropped_in_a_row += 1;
+        }
+
+        if let Some(front) = state.decoded.front() {
+            state.decoded.len() == 1
+                && !state.inputs.is_empty()
+                && !front.end
+                && state.dropped_in_a_row < Self::MAX_DROPPED_IN_A_ROW
+                && front.pts + state.frame_interval < due_pts
+        } else {
+            false
+        }
+    }
+
     /// The worker: decodes queued input a few frames ahead, puts each decoded frame, once it is
     /// due, into the next free image, and counts unregistered images off in their turn.
     fn run(&self) {
@@ -715,35 +832,34 @@ impl Shared {
                 self.increment();
                 continue;
             }
-            let (now, host_now) = (self.now_us(), Instant::now());
-            let mut wake = None;
-            if let (Some(decoded), Some(&Some(handout))) =
-                (state.decoded.front(), state.free.front())
+
+            if !state.decoded.is_empty()
+                && !state.free.is_empty()
+                && !self.drop_overtaken_frames(&mut state)
             {
+                state.dropped_in_a_row = 0;
+                let decoded = state.decoded.pop_front().expect("checked above");
+                let handout = state.free.pop_front().flatten().expect("checked above");
+
                 let picture = decoded.frame.is_some();
-                let due = if decoded.end && !picture {
-                    now
-                } else {
-                    let pts = decoded.pts;
-                    state.clock.due(now, pts)
-                };
-                if due <= now
-                    && picture
+                if picture
                     && let Some((syncpoint, value)) = handout.release
                     && self.syncpoints.guest().is_reached(syncpoint, value) == Ok(false)
                 {
                     let key = (handout.image, value);
                     let since = match release_wait {
                         Some((waiting, since)) if waiting == key => since,
-                        _ => release_wait.insert((key, host_now)).1,
+                        _ => release_wait.insert((key, Instant::now())).1,
                     };
-                    if host_now - since < RELEASE_LIMIT {
+                    if Instant::now().duration_since(since) < RELEASE_LIMIT {
                         drop(state);
                         let _ = self
                             .syncpoints
                             .guest()
                             .wait(syncpoint, value, Some(RELEASE_SLICE));
                         state = self.state.lock();
+                        state.free.push_front(Some(handout));
+                        state.decoded.push_front(decoded);
                         continue;
                     }
                     tracing::warn!(
@@ -752,67 +868,70 @@ impl Shared {
                         handout.image
                     );
                 }
-                if due <= now {
-                    let decoded = state.decoded.pop_front().expect("checked above");
-                    state.free.pop_front();
-                    let size = (state.width, state.height);
-                    let (width, height) = match &decoded.frame {
-                        Some(frame) => {
-                            state.writing = true;
-                            let stops = state.stops;
-                            drop(state);
-                            let size = self.write(&mut media, handout, frame, size);
-                            state = self.state.lock();
-                            state.writing = false;
-                            self.idle.notify_all();
-                            if state.stops != stops {
-                                state.frames.extend(decoded.frame);
-                                continue;
-                            }
-                            size
+
+                let size = (state.width, state.height);
+                let (width, height) = match &decoded.frame {
+                    Some(frame) => {
+                        state.writing = true;
+                        let stops = state.stops;
+                        drop(state);
+                        let size = self.write(&mut media, handout, frame, size);
+                        state = self.state.lock();
+                        state.writing = false;
+                        self.idle.notify_all();
+                        if state.stops != stops {
+                            state.frames.extend(decoded.frame);
+                            continue;
                         }
-                        None => size,
-                    };
-                    state.frames.extend(decoded.frame);
-                    state.outputs.push_back(Output {
-                        image: handout.image,
-                        width,
-                        height,
-                        pts: decoded.pts,
-                        end: decoded.end,
-                    });
-                    media.frames_out += 1;
-                    if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end
-                    {
-                        tracing::info!(
-                            "nx2:vdecsvc frame {} ({width}x{height}, pts {} us{}) in image {}, \
-                             {} decoded, {:.2} ms per decode",
-                            media.frames_out,
-                            decoded.pts,
-                            if decoded.end { ", end of stream" } else { "" },
-                            handout.image,
-                            media.pictures,
-                            media.decode_time.as_secs_f64() * 1000.0 / media.decodes.max(1) as f64,
-                        );
+                        size
                     }
-                    if decoded.end {
-                        state.stream_ended = true;
-                        state.end_queued = false;
-                        state.clock = MovieClock::default();
-                    }
-                    self.increment();
-                    continue;
+                    None => size,
+                };
+                state.frames.extend(decoded.frame);
+                state.outputs.push_back(Output {
+                    image: handout.image,
+                    width,
+                    height,
+                    pts: decoded.pts,
+                    end: decoded.end,
+                });
+                media.frames_out += 1;
+                if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end {
+                    tracing::info!(
+                        "nx2:vdecsvc frame {} ({width}x{height}, pts {} us{}) in image {}, \
+                         {} decoded, {} late dropped, client holds {} of {} images",
+                        media.frames_out,
+                        decoded.pts,
+                        if decoded.end { ", end of stream" } else { "" },
+                        handout.image,
+                        media.pictures,
+                        state.frames_dropped,
+                        state.client_held_images(),
+                        state.registered.len(),
+                    );
                 }
-                wake = Some(host_now + Duration::from_micros(due - now));
+                if decoded.end {
+                    state.stream_ended = true;
+                    state.end_queued = false;
+                    state.clock.reset();
+                }
+                self.increment();
+                continue;
             }
+
             if state.decoded.len() < DECODE_AHEAD
                 && let Some(input) = state.inputs.pop_front()
             {
                 let codec = state.codec;
                 let mut frames = std::mem::take(&mut state.frames);
+                let input_pts = input.pts;
                 drop(state);
                 media.decode(codec, &input, &mut frames);
                 state = self.state.lock();
+                if state.last_decoded_pts != 0 && input_pts > state.last_decoded_pts {
+                    state.frame_interval = input_pts - state.last_decoded_pts;
+                }
+                state.last_decoded_pts = input_pts;
                 state.frames.append(&mut frames);
                 state.spare.push(input.data);
                 if std::mem::take(&mut state.reset) {
@@ -824,11 +943,13 @@ impl Shared {
                 }
                 continue;
             }
+
+            let mut wake = None;
             if state.armed && state.running && state.has_room() {
                 self.ready.signal();
-                let next = host_now + READY_INTERVAL;
-                wake = Some(wake.map_or(next, |due: Instant| due.min(next)));
+                wake = Some(Instant::now() + READY_INTERVAL);
             }
+
             match wake {
                 Some(at) => {
                     self.wake.wait_until(&mut state, at);
