@@ -894,10 +894,10 @@ impl Shared {
                         if Instant::now().duration_since(since) < RELEASE_LIMIT {
                             let stops = state.stops;
                             drop(state);
-                            let _ = self
-                                .syncpoints
-                                .guest()
-                                .wait(syncpoint, value, Some(RELEASE_SLICE));
+                            let _ =
+                                self.syncpoints
+                                    .guest()
+                                    .wait(syncpoint, value, Some(RELEASE_SLICE));
                             state = self.state.lock();
                             if state.stops != stops {
                                 let frame = state.decoded.pop_front().and_then(|d| d.frame);
@@ -945,7 +945,8 @@ impl Shared {
                         end: decoded.end,
                     });
                     media.frames_out += 1;
-                    if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end {
+                    if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end
+                    {
                         tracing::info!(
                             "nx2:vdecsvc frame {} ({width}x{height}, pts {} us{}) in image {}, \
                              {} decoded, {} late dropped, client holds {} of {} images",

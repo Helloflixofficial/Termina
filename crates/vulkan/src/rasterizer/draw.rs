@@ -2781,19 +2781,6 @@ impl VulkanRasterizer {
                 removals = self.texture_cache.removals();
             }
         };
-        if module.hash == 0xb0801807662375d7 {
-            return Ok(());
-        }
-        if (module.hash == 0x28219a3227b04edd || module.hash == 0xd5917834384e5046)
-            && !self.draw.textures.is_empty()
-            && !self.draw.storage_images.is_empty()
-        {
-            let src_id = self.draw.textures[0];
-            let dst_id = self.draw.storage_images[0].0;
-            self.texture_cache
-                .blit_between(&mut self.scheduler, src_id, dst_id)?;
-            return Ok(());
-        }
         let set = self.descriptor_set(template)?;
         let batched = grid.is_none()
             && self.draw.texel_views.is_empty()
@@ -3019,13 +3006,31 @@ fn storage_pointer(
     let pointer: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset);
     if desc.indirect_offset == StorageBufferDescriptor::DIRECT {
         let size: u32 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset + 8);
-        return (pointer, u64::from(size).min(limit));
+        let size = if size == 0 && src.pool.switch2 {
+            src.gmmu.continuous_size(pointer, 8 << 20).min(limit)
+        } else {
+            u64::from(size).min(limit)
+        };
+        return (pointer, size);
     }
     let address = src
         .gmmu
         .read::<u64>(pointer + u64::from(desc.indirect_offset))
         .unwrap_or(0);
-    (address, (64 << 10u64).min(limit))
+    if address == 0 {
+        return (0, 0);
+    }
+    let size = if desc.is_written {
+        (64 << 10u64).min(limit)
+    } else {
+        let continuous = src.gmmu.continuous_size(address, limit.min(1 << 30));
+        if continuous > 0 {
+            continuous.min(limit)
+        } else {
+            (64 << 10u64).min(limit)
+        }
+    };
+    (address, size)
 }
 
 /// The largest storage buffer range a binding may ask for: the host's limit, less the bytes

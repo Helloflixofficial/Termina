@@ -449,15 +449,40 @@ impl Gmmu {
         }
     }
 
+    /// Returns the length of the contiguous device mapping starting at `gpu_va`, up to `max_reach` bytes.
+    ///
+    /// Stops at the first unmapped or non-device page, or where the device addresses stop being contiguous.
+    pub fn continuous_size(&self, gpu_va: GpuVAddr, max_reach: u64) -> u64 {
+        if gpu_va >= GPU_VA_SIZE || max_reach == 0 {
+            return 0;
+        }
+        let end = gpu_va.saturating_add(max_reach).min(GPU_VA_SIZE);
+        let mut va = gpu_va;
+        let mut expected_daddr = None;
+        let mut continuous = 0;
+
+        while va < end {
+            let (pte, page) = self.lookup(va);
+            if pte.state() != MAPPED {
+                break;
+            }
+            let offset = va & (page - 1);
+            let daddr = pte.daddr() + offset;
+            if expected_daddr.is_some_and(|expected| daddr != expected) {
+                break;
+            }
+            let chunk = (page - offset).min(end - va);
+            continuous += chunk;
+            expected_daddr = Some(daddr + chunk);
+            va += chunk;
+        }
+
+        continuous
+    }
+
     /// Whether [`gpu_va`, +`size`) is mapped to one contiguous device range.
     pub fn is_continuous(&self, gpu_va: GpuVAddr, size: u64) -> bool {
-        let mut runs = 0;
-        let mut device = true;
-        self.for_each_range(gpu_va, size, |range| {
-            runs += 1;
-            device &= matches!(range.target, RangeTarget::Device(_));
-        });
-        runs == 1 && device
+        size > 0 && self.continuous_size(gpu_va, size) >= size
     }
 
     /// Copies device memory a page at a time; unmapped pages read zero. Returns the first
@@ -910,6 +935,8 @@ mod tests {
         );
         assert!(gmmu.is_continuous(0x30_1000, 0x2000));
         assert!(!gmmu.is_continuous(0x30_0000, 0x2000));
+        assert_eq!(gmmu.continuous_size(0x30_1000, 0x4000), 0x2000);
+        assert_eq!(gmmu.continuous_size(0x30_0000, 0x4000), 0x1000);
         assert_eq!(
             gmmu.read::<u64>(0x30_0ffc),
             Ok(u64::from_le_bytes(back[0x7fc..0x804].try_into().unwrap()))

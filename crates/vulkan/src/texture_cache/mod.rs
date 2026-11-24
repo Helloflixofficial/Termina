@@ -1960,6 +1960,7 @@ impl TextureCache {
     }
 
     /// Blits from `src_id` to `dst_id` using hardware bilinear scaling.
+    #[allow(dead_code)]
     pub(crate) fn blit_between(
         &mut self,
         scheduler: &mut Scheduler,
