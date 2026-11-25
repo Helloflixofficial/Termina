@@ -265,8 +265,8 @@ impl Thresholds {
         let margin = (budget / 8).min(1 << 30);
         let retain = budget - margin;
         let critical = match vram_usage {
-            VramUsage::Conservative => retain.min((budget / 8 * 5).max(5 << 30)),
-            VramUsage::Aggressive => retain,
+            VramUsage::Conservative if budget >= (1 << 30) => retain.min(budget / 8 * 5),
+            VramUsage::Conservative | VramUsage::Aggressive => retain,
         };
         Self {
             expected: critical - margin.min(critical / 2),
@@ -299,10 +299,20 @@ impl CacheBudget {
         }
         match vram_usage {
             VramUsage::Conservative => {
-                let expected = (device_local / 2).min(CACHE_EXPECTED_MAX);
-                Self {
-                    expected,
-                    critical: expected + expected / 4,
+                // On 4 GB class GPUs (1..=4.5 GiB), leave room for the swapchain, pipelines, and
+                // driver before VRAM spills across PCIe into system RAM.
+                if (1 << 30..=9 << 29).contains(&device_local) {
+                    let expected = device_local / 8 * 3;
+                    Self {
+                        expected,
+                        critical: device_local / 2,
+                    }
+                } else {
+                    let expected = (device_local / 2).min(CACHE_EXPECTED_MAX);
+                    Self {
+                        expected,
+                        critical: expected + expected / 4,
+                    }
                 }
             }
             VramUsage::Aggressive => Self {

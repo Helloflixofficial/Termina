@@ -56,6 +56,43 @@ impl ConsoleGeneration {
     }
 }
 
+/// Host physical RAM threshold (10 GiB) below which background worker pools, shader prebuilds,
+/// and transient staging caps scale down to prevent Windows paging stutter.
+pub const CONSTRAINED_HOST_RAM_BYTES: u64 = 10 << 30;
+
+/// Returns total physical host memory in bytes when available from the OS.
+pub fn host_ram_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status = MEMORYSTATUSEX {
+            dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `status` is a local struct whose `dwLength` field is initialized above.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0 {
+            return Some(status.ullTotalPhys);
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        Some(kib * 1024)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Whether this machine has constrained physical RAM (<= 10 GiB usable, e.g. 8 GB laptops).
+pub fn is_constrained_host_ram() -> bool {
+    host_ram_bytes().is_some_and(|bytes| bytes <= CONSTRAINED_HOST_RAM_BYTES)
+}
+
 /// Installs the global tracing subscriber. `filter` uses `EnvFilter` syntax; `RUST_LOG` wins when set.
 pub fn init_logging(filter: &str) {
     use tracing_subscriber::EnvFilter;

@@ -1806,6 +1806,11 @@ fn collector_thresholds_follow_the_budget_and_vram_setting() {
         "large budgets collect from 5/8 of them, not from a fixed ~7 GB cap"
     );
     assert_eq!(
+        t(4 * GIB, VramUsage::Conservative),
+        want(2 * GIB, 5 * GIB / 2, 7 * GIB / 2),
+        "4 GiB GPUs enforce conservative eviction before overflowing VRAM"
+    );
+    assert_eq!(
         t(4 << 20, VramUsage::Conservative),
         want(3 << 20, 7 << 19, 7 << 19),
         "small budgets keep an eighth free"
@@ -2001,6 +2006,11 @@ fn cache_budget_follows_the_device_local_heaps() {
         b(10 * GIB, VramUsage::Conservative),
         want(4 * GIB, 5 * GIB),
         "a 10 GiB card collects from 4 GiB, not from half of it"
+    );
+    assert_eq!(
+        b(4 * GIB, VramUsage::Conservative),
+        want(3 * GIB / 2, 2 * GIB),
+        "4 GiB GPUs keep texture/buffer caches tighter for swapchain & pipeline headroom"
     );
     assert_eq!(
         b(6 * GIB, VramUsage::Conservative),

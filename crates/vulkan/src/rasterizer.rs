@@ -46,7 +46,7 @@ use crate::debug::renderdoc::{self, FrameCapture};
 use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
-use crate::host_budget::RING_OVERSIZED_CAP;
+use crate::host_budget::effective_ring_oversized_cap;
 use crate::memory::{Buffer, Image, ImageDesc, LiveMemory, MemoryCounts, MemoryObjects};
 use crate::pipeline::PipelineCache;
 use crate::pipeline::shader_cache::ShaderCache;
@@ -439,7 +439,7 @@ impl VulkanRasterizer {
         scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
-        let staging = StagingRing::new(device, 32 << 20, RING_OVERSIZED_CAP)?;
+        let staging = StagingRing::new(device, 32 << 20, effective_ring_oversized_cap())?;
         let samples = samples::SampleCounter::new(device)?;
         let conditions = conditions::Conditions::new(device)?;
         Ok(Self {

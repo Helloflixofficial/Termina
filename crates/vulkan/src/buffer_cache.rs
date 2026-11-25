@@ -34,7 +34,7 @@ use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 use crate::host_budget::{
-    Oversized, PART_SLICE, RING_OVERSIZED_CAP, Readback, STAGING_REQUEST_MAX,
+    Oversized, PART_SLICE, Readback, STAGING_REQUEST_MAX, effective_ring_oversized_cap,
 };
 use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::{Scheduler, Timeline};
@@ -1346,7 +1346,7 @@ impl BufferCache {
             stream: StagingRing::with_usage(
                 device,
                 STREAM_RING_SIZE,
-                RING_OVERSIZED_CAP,
+                effective_ring_oversized_cap(),
                 STREAM_USAGE,
                 "buffer cache stream",
                 "buffer cache stream (oversized)",
@@ -3287,6 +3287,7 @@ mod tests {
     use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
 
     use super::*;
+    use crate::host_budget::RING_OVERSIZED_CAP;
     use crate::{Instance, SurfaceSupport};
 
     /// A seeded random stream of GPU-written range insertions and write-backs: the masked set

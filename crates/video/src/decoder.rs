@@ -139,7 +139,7 @@ impl Decoder {
                 return Err(VideoError::Ffmpeg(-12));
             }
             let context = decoder.context.cast::<c_void>();
-            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 4));
             (api.av_opt_set_int)(context, c"threads".as_ptr(), threads as i64, 0);
             let thread_type = match latency {
                 Latency::Immediate => c"slice",

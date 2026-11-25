@@ -6,3 +6,5 @@
 *.log
 *.raw
 *.dump
+/perf_logs
+__pycache__/

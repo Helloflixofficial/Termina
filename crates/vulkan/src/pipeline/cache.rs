@@ -1034,19 +1034,33 @@ const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Most pipeline worker threads, and so most driver pipeline compiles running at once, each
 /// holding its own driver scratch memory.
-const MAX_PIPELINE_WORKERS: usize = 32;
+const MAX_PIPELINE_WORKERS: usize = 8;
+/// Cap for pipeline worker threads on constrained-RAM hosts (<= 10 GiB).
+const CONSTRAINED_PIPELINE_WORKERS: usize = 3;
 /// Runs whose pipelines the boot prebuild builds: the last two, so one short run (a boot to the
 /// menu, a crash) does not drop the run before it.
 const PREBUILD_RUNS: u16 = 2;
-/// Most pipelines the boot prebuild queues. Prebuild all recent pipelines rather than truncating.
-const PREBUILD_LIMIT: usize = 4096;
+/// Most pipelines the boot prebuild queues.
+const PREBUILD_LIMIT: usize = 2048;
+/// Boot prebuild cap on constrained-RAM hosts to bound driver cache memory.
+const CONSTRAINED_PREBUILD_LIMIT: usize = 512;
 /// Runs in a row, the saving one included, a stored key may go unused before a save drops it.
 const KEEP_RUNS: u16 = 8;
 
-/// Pipeline workers for a host with `available` hardware threads: all but one, for the GPU
-/// thread, and between 1 and [`MAX_PIPELINE_WORKERS`].
+/// Pipeline workers for a host with `available` hardware threads: leaves core headroom for guest
+/// emulation and GPU threads, and clamps tightly on constrained-RAM hosts to avoid paging.
 fn worker_count(available: usize) -> usize {
-    available.saturating_sub(1).clamp(1, MAX_PIPELINE_WORKERS)
+    worker_count_for(available, !lichii_common::is_constrained_host_ram())
+}
+
+fn worker_count_for(available: usize, ample_ram: bool) -> usize {
+    if ample_ram {
+        available.saturating_sub(2).clamp(1, MAX_PIPELINE_WORKERS)
+    } else {
+        available
+            .saturating_sub(6)
+            .clamp(1, CONSTRAINED_PIPELINE_WORKERS)
+    }
 }
 
 /// A stored key [`PipelineCache::prebuild`] queues, by its index in [`Contents`].
@@ -1057,8 +1071,8 @@ enum StoredKey {
 }
 
 /// The stored keys the boot prebuild queues: those used within the last [`PREBUILD_RUNS`]
-/// runs, most recent first, at most [`PREBUILD_LIMIT`].
-fn prebuild_selection(stored: &Contents) -> Vec<StoredKey> {
+/// runs, most recent first, up to `limit`.
+fn prebuild_selection(stored: &Contents, limit: usize) -> Vec<StoredKey> {
     let graphics = stored
         .graphics
         .iter()
@@ -1076,7 +1090,7 @@ fn prebuild_selection(stored: &Contents) -> Vec<StoredKey> {
         .filter(|&(age, _)| age <= PREBUILD_RUNS)
         .collect();
     selected.sort_by_key(|&(age, _)| age);
-    selected.truncate(PREBUILD_LIMIT);
+    selected.truncate(limit);
     selected.into_iter().map(|(_, key)| key).collect()
 }
 
@@ -1642,8 +1656,13 @@ impl PipelineCache {
     /// others build on first use.
     pub fn prebuild(&mut self, mut resolve: impl FnMut(u64) -> Option<Arc<ShaderModule>>) -> usize {
         let stored = std::mem::take(&mut self.stored);
+        let limit = if lichii_common::is_constrained_host_ram() {
+            CONSTRAINED_PREBUILD_LIMIT
+        } else {
+            PREBUILD_LIMIT
+        };
         let mut queued = 0;
-        for selected in prebuild_selection(&stored) {
+        for selected in prebuild_selection(&stored, limit) {
             let (index, age) = match selected {
                 StoredKey::Graphics(i) => {
                     let Aged { key, age } = &stored.graphics[i];
@@ -3158,8 +3177,12 @@ mod tests {
     #[test]
     fn worker_count_leaves_a_thread_and_stays_within_the_cap() {
         assert_eq!(
-            [0, 1, 2, 3, 5, 12, 24, 128].map(worker_count),
-            [1, 1, 1, 2, 4, 11, 23, 32]
+            [0, 1, 2, 3, 5, 12, 24, 128].map(|n| worker_count_for(n, true)),
+            [1, 1, 1, 1, 3, 8, 8, 8]
+        );
+        assert_eq!(
+            [0, 1, 2, 7, 8, 12, 16].map(|n| worker_count_for(n, false)),
+            [1, 1, 1, 1, 2, 3, 3]
         );
     }
 
@@ -3184,10 +3207,10 @@ mod tests {
             blob: Vec::new(),
         };
         assert_eq!(
-            prebuild_selection(&contents(
-                &[3, 1, disk::UNRECORDED_AGE, 2, 1],
-                &[2, 1, KEEP_RUNS]
-            )),
+            prebuild_selection(
+                &contents(&[3, 1, disk::UNRECORDED_AGE, 2, 1], &[2, 1, KEEP_RUNS]),
+                PREBUILD_LIMIT,
+            ),
             [
                 Graphics(1),
                 Graphics(4),
@@ -3197,7 +3220,8 @@ mod tests {
             ],
             "keys from the last two runs, the last run's first"
         );
-        let selected = prebuild_selection(&contents(&[2; PREBUILD_LIMIT], &[1; 10]));
+        let selected =
+            prebuild_selection(&contents(&[2; PREBUILD_LIMIT], &[1; 10]), PREBUILD_LIMIT);
         assert_eq!(
             selected,
             (0..10)

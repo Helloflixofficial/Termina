@@ -36,6 +36,16 @@ pub const READBACK_DECAY_DOWNLOADS: u32 = 8;
 pub const RING_OVERSIZED_CAP: u64 =
     (RASTERIZER_HOST_CAP - RASTERIZER_READBACKS * (READBACK_LIMIT - READBACK_BASE)) / 2;
 
+/// Ring oversized buffer cap adapted to host physical RAM: halved on <= 10 GiB hosts so
+/// transient staging buffers reclaim quickly instead of pushing Windows to page.
+pub fn effective_ring_oversized_cap() -> u64 {
+    if lichii_common::is_constrained_host_ram() {
+        (RING_OVERSIZED_CAP / 2).max(STAGING_REQUEST_MAX)
+    } else {
+        RING_OVERSIZED_CAP
+    }
+}
+
 /// In-flight [`Oversized`] bytes the presenter's staging ring may hold.
 pub const PRESENT_OVERSIZED_CAP: u64 = 64 << 20;
 
