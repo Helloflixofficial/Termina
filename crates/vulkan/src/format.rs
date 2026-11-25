@@ -256,6 +256,7 @@ fn alternatives(format: vk::Format) -> &'static [(vk::Format, Fallback)] {
             (vk::Format::D24_UNORM_S8_UINT, Convert),
         ],
         vk::Format::D16_UNORM => &[(vk::Format::D32_SFLOAT, Convert)],
+        vk::Format::R32G32B32_SFLOAT => &[(vk::Format::R32G32B32A32_SFLOAT, Convert)],
         vk::Format::A4B4G4R4_UNORM_PACK16 => &[
             (vk::Format::R4G4B4A4_UNORM_PACK16, Swizzle(REVERSE)),
             (vk::Format::A8B8G8R8_UNORM_PACK32, Convert),

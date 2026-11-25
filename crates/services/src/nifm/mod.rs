@@ -229,7 +229,7 @@ impl Service for GeneralService {
             }
             5 => write(ctx, &self.network.current_profile()),
             8 => write_zeroed(ctx, SF_NETWORK_PROFILE_SIZE),
-            6 | 7 | 11 | 35 | 47 => {
+            6 | 7 | 11 | 35 | 47 | 101 => {
                 ctx.push(0u32);
                 ResultCode::SUCCESS
             }

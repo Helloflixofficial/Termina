@@ -359,11 +359,14 @@ pub enum MemoryLayout {
 impl MemoryLayout {
     pub fn dram_size(self, console: ConsoleGeneration) -> u64 {
         const GIB: u64 = 1 << 30;
-        match (self, console) {
-            (Self::Auto, ConsoleGeneration::Switch1) | (Self::Dram4GiB, _) => 4 * GIB,
-            (Self::Auto, ConsoleGeneration::Switch2) | (Self::Dram12GiB, _) => 12 * GIB,
-            (Self::Dram6GiB, _) => 6 * GIB,
-            (Self::Dram8GiB, _) => 8 * GIB,
+        if console == ConsoleGeneration::Switch2 {
+            return 12 * GIB;
+        }
+        match self {
+            Self::Auto | Self::Dram4GiB => 4 * GIB,
+            Self::Dram6GiB => 6 * GIB,
+            Self::Dram8GiB => 8 * GIB,
+            Self::Dram12GiB => 12 * GIB,
         }
     }
 }

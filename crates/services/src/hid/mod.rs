@@ -560,7 +560,7 @@ impl Service for HidServer {
                 }
                 Ok(())
             }
-            26 | 32 | 91 | 92 => Ok(()),
+            26 | 32 | 91 | 92 | 3150 => Ok(()),
             400 => {
                 ctx.push(0u8);
                 Ok(())
