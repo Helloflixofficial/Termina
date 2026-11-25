@@ -52,11 +52,11 @@ use lichii_gpu::backend::{FramebufferConfig, GpuWrittenPages};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
-use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::{
     GOB_HEIGHT, GOB_SIZE, GOB_WIDTH, GobLayout, Tiling, swizzle, unswizzle,
 };
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
+use lichii_texture::{Compression, PixelFormat};
 
 pub use blit::{BlitSide, NearestSampling};
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
@@ -943,6 +943,7 @@ pub struct TextureCache {
     lazy: Arc<LazyDeviceRanges>,
     gob_layout: GobLayout,
     recompression: AstcRecompression,
+    opaque_astc_bc1: bool,
     astc_decode: AstcDecode,
     /// The GPU ASTC decoder, created by the first upload that needs it.
     astc: Option<astc::AstcDecoder>,
@@ -1033,6 +1034,8 @@ pub struct TextureCache {
     frame_ends: VecDeque<(u64, u64)>,
     /// The budget the collector last ran with.
     budget: CacheBudget,
+    /// Total device-local heap bytes queried at creation.
+    device_local: u64,
 }
 
 /// A depth or stencil view returns its value in R and leaves G undefined, while guest
@@ -1367,12 +1370,14 @@ impl TextureCache {
         gob_layout: GobLayout,
         recompression: AstcRecompression,
     ) -> Self {
+        let device_local = device.memory_usage().device_local;
         Self {
             device: device.clone(),
             written_pages,
             lazy,
             gob_layout,
             recompression,
+            opaque_astc_bc1: std::env::var_os("LICHII_ASTC_BC1").is_none_or(|v| v != "0"),
             astc_decode: AstcDecode::default(),
             astc: None,
             astc_scratch: astc::SCRATCH_BYTES,
@@ -1406,8 +1411,7 @@ impl TextureCache {
             sparse_capped: false,
             sparse_cap: SPARSE_IMAGE_CAP,
             trim_above: TRIM_ABOVE,
-            trim_to: (device.memory_usage().device_local / TRIM_TO_SHARE)
-                .clamp(TRIM_TO_MIN, TRIM_TO_MAX),
+            trim_to: (device_local / TRIM_TO_SHARE).clamp(TRIM_TO_MIN, TRIM_TO_MAX),
             #[cfg(test)]
             allocation_cap: u64::MAX,
             serials: 0,
@@ -1435,7 +1439,8 @@ impl TextureCache {
             eviction_readback: Readback::default(),
             image_bytes: 0,
             frame_ends: VecDeque::new(),
-            budget: CacheBudget::new(device.memory_usage().device_local, VramUsage::default()),
+            budget: CacheBudget::new(device_local, VramUsage::default()),
+            device_local,
             stats: CollectorStats::default(),
         }
     }
@@ -1459,6 +1464,11 @@ impl TextureCache {
     pub fn set_astc_recompression(&mut self, recompression: AstcRecompression) {
         self.recompression = recompression;
         self.host_formats.fill(None);
+    }
+
+    /// Controls whether opaque ASTC textures under [`AstcRecompression::Bc3`] use BC1.
+    pub fn set_opaque_astc_bc1(&mut self, enabled: bool) {
+        self.opaque_astc_bc1 = enabled;
     }
 
     /// Where ASTC textures the device cannot sample decode from now on: on the GPU, or on the
@@ -3032,7 +3042,7 @@ impl TextureCache {
         }
         self.dropped = dropped;
         let segments = self.segments.clone();
-        let id = self.create(info, segments, trim, sparse_va)?;
+        let id = self.create(tx.memory, info, segments, trim, sparse_va)?;
         let new_overlaps = std::mem::take(&mut self.new_overlaps);
         for &other in &new_overlaps {
             self.image(other).overlaps.push(id);
@@ -3223,15 +3233,82 @@ impl TextureCache {
         Ok(())
     }
 
+    /// Checks whether every 16-byte ASTC block in `segments` carries opaque alpha so a BC3
+    /// target can step down to BC1 (halving texture VRAM and host driver commit).
+    fn astc_is_opaque(
+        &mut self,
+        info: &ImageInfo,
+        segments: &[Segment],
+        memory: &DeviceAddressSpace,
+    ) -> bool {
+        const MAX_SCAN_BYTES: u64 = 64 << 20;
+        const CHUNK_BYTES: usize = 4 << 20;
+        let total = info.size_bytes();
+        if total == 0 || total > MAX_SCAN_BYTES || segments.is_empty() {
+            return false;
+        }
+        let scan_len = (total as usize).next_multiple_of(lichii_texture::astc::BLOCK_BYTES);
+        let buf_len = scan_len.min(CHUNK_BYTES);
+        resize_exact(&mut self.scratch.tiled, buf_len);
+        let mut offset = 0u64;
+        while offset < total {
+            let chunk = ((total - offset) as usize)
+                .min(CHUNK_BYTES)
+                .next_multiple_of(lichii_texture::astc::BLOCK_BYTES);
+            let slice = &mut self.scratch.tiled[..chunk];
+            let end = offset + chunk as u64;
+            let mut covered = true;
+            let mut pos = offset;
+            for s in segments {
+                let (start, stop) = (s.offset.max(offset), (s.offset + s.size).min(end));
+                if start >= stop {
+                    continue;
+                }
+                if start > pos {
+                    covered = false;
+                    break;
+                }
+                let dst = &mut slice[(start - offset) as usize..(stop - offset) as usize];
+                let daddr = s.daddr + (start - s.offset);
+                if memory.read_bytes(daddr, dst).is_err() {
+                    covered = false;
+                    break;
+                }
+                pos = stop;
+            }
+            if !covered || pos < total.min(end) {
+                return false;
+            }
+            // Zero any trailing alignment bytes past `total` within the final 16-byte chunk.
+            let valid = (total - offset).min(chunk as u64) as usize;
+            let blocks_len = valid - (valid % lichii_texture::astc::BLOCK_BYTES);
+            if blocks_len > 0 && !lichii_texture::astc::is_opaque(&slice[..blocks_len]) {
+                return false;
+            }
+            offset += chunk as u64;
+        }
+        true
+    }
+
     fn create(
         &mut self,
+        memory: &DeviceAddressSpace,
         info: &ImageInfo,
         segments: Vec<Segment>,
         trim: u32,
         sparse_va: Option<GpuVAddr>,
     ) -> Result<ImageId> {
         self.creations += 1;
-        let host = self.image_host(info);
+        let mut host = self.image_host(info);
+        if self.opaque_astc_bc1
+            && matches!(host.conversion, Conversion::DecodeToBc(Compression::Bc3))
+            && info.kind != ImageKind::D3
+            && trim == 0
+            && sparse_va.is_none()
+            && self.astc_is_opaque(info, &segments, memory)
+        {
+            host = host_format(&self.device, info.format, AstcRecompression::Bc1);
+        }
         let mut desc = Self::image_desc(info, &host, ResolutionScale::X1);
         if trim > 0 {
             desc.extent.width = (desc.extent.width >> trim).max(1);
@@ -4802,10 +4879,20 @@ impl TextureCache {
             OLD_AGE
         };
         let unused_before = self.unused_before(age);
+        let constrained_vram = (1 << 30..=9 << 29).contains(&usage.device_local);
         let mut evictions = if aggressive {
-            AGGRESSIVE_EVICTIONS
+            if constrained_vram {
+                AGGRESSIVE_EVICTIONS * 2
+            } else {
+                AGGRESSIVE_EVICTIONS
+            }
         } else {
             NORMAL_EVICTIONS
+        };
+        let max_flush_bytes = if constrained_vram && aggressive {
+            MAX_FLUSH_BYTES * 2
+        } else {
+            MAX_FLUSH_BYTES
         };
         let mut visits = evictions * VISITS_PER_EVICTION;
         let (mut flush_bytes, mut queued_bytes) = (0, 0);
@@ -4831,7 +4918,7 @@ impl TextureCache {
                         let (size, _) = image.readback_size();
                         if !aggressive
                             || !can_flush
-                            || (flush_bytes > 0 && flush_bytes + size > MAX_FLUSH_BYTES)
+                            || (flush_bytes > 0 && flush_bytes + size > max_flush_bytes)
                         {
                             continue;
                         }
@@ -4943,8 +5030,13 @@ impl TextureCache {
         let unused_before = self.unused_before(RECENT_AGE);
         if cached > critical {
             let target = (cached - critical).min(bytes);
-            let (mut freed, mut evictions) = (0, CREATE_EVICTIONS);
-            let mut visits = CREATE_EVICTIONS * VISITS_PER_EVICTION;
+            let max_evictions = if (1 << 30..=9 << 29).contains(&self.device_local) {
+                CREATE_EVICTIONS * 2
+            } else {
+                CREATE_EVICTIONS
+            };
+            let (mut freed, mut evictions) = (0, max_evictions);
+            let mut visits = max_evictions * VISITS_PER_EVICTION;
             let (mut cursor, mut buffer) = (self.lru_head, tx.buffers.lru_head());
             while freed < target && evictions > 0 && visits > 0 {
                 let Some(oldest) = self.lru_oldest(tx.buffers, cursor, buffer, unused_before)

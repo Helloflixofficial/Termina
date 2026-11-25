@@ -69,12 +69,14 @@ impl Fixture {
         gmmu.map(GPU_VA, DADDR, dram, 0, false).unwrap();
         let written = Arc::new(GpuWrittenPages::new(36));
         let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
+        let mut cache = TextureCache::new(&device, written.clone(), lazy.clone(), gob, recompression);
+        cache.set_opaque_astc_bc1(false);
         Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
             staging: StagingRing::new(&device, 32 << 20, RING_OVERSIZED_CAP).unwrap(),
             buffers: BufferCache::new(&device, memory.clone(), written.clone(), lazy.clone())
                 .unwrap(),
-            cache: TextureCache::new(&device, written, lazy, gob, recompression),
+            cache,
             device,
             memory,
             gmmu,
@@ -486,6 +488,57 @@ fn recompresses_astc_to_bc1_and_bc3_on_the_cpu() {
         assert!(read[0] == want, "{bc:?} blocks differ");
         f.assert_no_validation_errors();
     }
+}
+
+#[test]
+fn recompresses_opaque_astc_to_bc1_and_keeps_alpha_as_bc3() {
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Bc3) else {
+        return;
+    };
+    let host_bc3 = host_format(&f.device, PixelFormat::Astc4x4Unorm, AstcRecompression::Bc3);
+    if host_bc3.conversion != Conversion::DecodeToBc(Compression::Bc3) {
+        eprintln!("skipping: ASTC is not recompressed on this device ({host_bc3:?})");
+        return;
+    }
+    f.cache.set_opaque_astc_bc1(true);
+    let (w, h) = (32, 32);
+    let s = surface(PixelFormat::Astc4x4Unorm, w, h, 1, 1, 0, GobLayout::Switch2);
+
+    // Opaque void-extent ASTC texture (alpha = 0xFFFF) steps down to BC1
+    let mut opaque_block = [0u8; 16];
+    opaque_block[0] = 0xFC;
+    opaque_block[1] = 0x0D;
+    opaque_block[14] = 0xFF;
+    opaque_block[15] = 0xFF;
+    let opaque_level: Vec<u8> = opaque_block
+        .iter()
+        .copied()
+        .cycle()
+        .take(s.level_size(0) as usize)
+        .collect();
+    write_surface(&f.memory, &s, &[opaque_level]);
+    let (opaque_id, _) = f.texture(&tic(0x40, GPU_VA, w, h, 1, 1, 0));
+    let opaque_state = f.cache.state(opaque_id).unwrap();
+    assert_eq!(opaque_state.format, vk::Format::BC1_RGBA_UNORM_BLOCK);
+
+    // Semi-transparent void-extent ASTC texture (alpha = 0x8000) stays BC3
+    let mut alpha_block = opaque_block;
+    alpha_block[15] = 0x80;
+    let alpha_level: Vec<u8> = alpha_block
+        .iter()
+        .copied()
+        .cycle()
+        .take(s.level_size(0) as usize)
+        .collect();
+    let va2 = GPU_VA + 0x10_0000;
+    let daddr2 = DADDR + 0x10_0000;
+    let mut data2 = vec![0u8; s.size_bytes() as usize];
+    data2[..alpha_level.len()].copy_from_slice(&alpha_level);
+    f.memory.write_bytes(daddr2, &data2).unwrap();
+    let (alpha_id, _) = f.texture(&tic(0x40, va2, w, h, 1, 1, 0));
+    let alpha_state = f.cache.state(alpha_id).unwrap();
+    assert_eq!(alpha_state.format, vk::Format::BC3_UNORM_BLOCK);
+    f.assert_no_validation_errors();
 }
 
 #[test]

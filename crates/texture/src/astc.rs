@@ -18,6 +18,96 @@ pub const BLOCK_BYTES: usize = 16;
 const MAX_TEXELS: usize = 144;
 const MAX_WEIGHTS: usize = 64;
 
+#[derive(Clone, Copy, Default)]
+struct ModeInfo {
+    error: bool,
+    dual_plane: bool,
+    weight_bits: u32,
+}
+
+fn mode_infos() -> &'static [ModeInfo; 2048] {
+    static TABLE: std::sync::OnceLock<[ModeInfo; 2048]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|mode| {
+            let Some(bm) = decode_block_mode(mode as u32) else {
+                return ModeInfo {
+                    error: true,
+                    dual_plane: false,
+                    weight_bits: 0,
+                };
+            };
+            ModeInfo {
+                error: false,
+                dual_plane: bm.dual_plane,
+                weight_bits: bm.weight_bits,
+            }
+        })
+    })
+}
+
+/// Returns `true` when every 16-byte ASTC block in `data` decodes with opaque alpha (`255` in
+/// LDR, `1.0` in HDR). Used to recompress opaque ASTC textures as BC1 (half the VRAM of BC3)
+/// without decoding every texel. Works on block-linear bytes directly because tiling permutes
+/// 16-byte blocks without reordering bytes inside a block.
+pub fn is_opaque(data: &[u8]) -> bool {
+    // Endpoint modes that carry an alpha channel: 4, 5 (LDR lum+alpha), 10 (RGB scale + 2 alpha),
+    // 12, 13 (LDR RGBA), 14, 15 (HDR RGBA).
+    const ALPHA_MODES: u32 =
+        (1 << 4) | (1 << 5) | (1 << 10) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+    let infos = mode_infos();
+    for block in data.as_chunks::<BLOCK_BYTES>().0 {
+        let low = u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        let mode = low & 0x7FF;
+        if mode & 0x1FF == 0x1FC {
+            if (low & 0xC00) != 0xC00 {
+                continue; // illegal void-extent decodes to opaque error color
+            }
+            let alpha = u16::from_le_bytes([block[14], block[15]]);
+            let opaque_val = if (mode >> 9) & 1 != 0 { 0x3C00 } else { 0xFFFF };
+            if alpha != opaque_val {
+                return false;
+            }
+            continue;
+        }
+        let info = infos[mode as usize];
+        if info.error {
+            continue;
+        }
+        let partitions = ((low >> 11) & 3) + 1;
+        if partitions == 4 && info.dual_plane {
+            continue;
+        }
+        if partitions == 1 {
+            let cem = (low >> 13) & 0xF;
+            if (ALPHA_MODES >> cem) & 1 != 0 {
+                return false;
+            }
+            continue;
+        }
+        let base_cem = (low >> 23) & 0x3F;
+        let base_mode = base_cem & 3;
+        if base_mode == 0 {
+            if (ALPHA_MODES >> (base_cem >> 2)) & 1 != 0 {
+                return false;
+            }
+            continue;
+        }
+        let high_bits = 3 * partitions - 4;
+        let below_weights = 128 - info.weight_bits - high_bits;
+        let raw = u128::from_le_bytes(*block);
+        let encoded = base_cem | (read(raw, below_weights, high_bits) << 6);
+        let base_class = base_mode - 1;
+        for i in 0..partitions {
+            let class = base_class + bit(encoded, 2 + i);
+            let cem = (class << 2) | bits(encoded, 2 + partitions + 2 * i, 2);
+            if (ALPHA_MODES >> cem) & 1 != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Decodes one block in the LDR profile into `block_w * block_h` RGBA8 texels, row-major.
 ///
 /// With `srgb` set the texels are sRGB-encoded bytes (the caller samples them through an sRGB
@@ -1303,5 +1393,42 @@ mod tests {
         assert_eq!(unorm16_to_f16(0), 0);
         assert_eq!(lns_to_f16(0x7800), 0x3C00);
         assert_eq!(lns_to_f16(0xFFFF), 0x7BFF);
+    }
+
+    #[test]
+    fn is_opaque_detects_alpha_vs_opaque_blocks() {
+        // Void extent LDR opaque (alpha = 0xFFFF) vs semi-transparent (alpha = 0x8000)
+        let mut opaque_void = [0u8; 16];
+        opaque_void[0] = 0xFC;
+        opaque_void[1] = 0x0D; // bits 10..11 set
+        opaque_void[14] = 0xFF;
+        opaque_void[15] = 0xFF;
+        assert!(is_opaque(&opaque_void));
+
+        let mut alpha_void = opaque_void;
+        alpha_void[15] = 0x80;
+        assert!(!is_opaque(&alpha_void));
+
+        // 1-partition CEM 8 (LDR RGB direct, opaque) vs CEM 12 (LDR RGBA direct, alpha)
+        let mut rgb_block = [0u8; 16];
+        rgb_block[0] = 0x43; // valid 1-partition weight block mode
+        rgb_block[1] = 0x00 | (8 << 5); // low bits 13..16 = CEM 8 (0x8 << 13 = bit 16)
+        // set bits 13..16 explicitly in low:
+        let low_cem8 = 0x43u32 | (8 << 13);
+        rgb_block[..4].copy_from_slice(&low_cem8.to_le_bytes());
+        assert!(is_opaque(&rgb_block));
+
+        let low_cem12 = 0x43u32 | (12 << 13);
+        let mut rgba_block = rgb_block;
+        rgba_block[..4].copy_from_slice(&low_cem12.to_le_bytes());
+        assert!(!is_opaque(&rgba_block));
+
+        // Combined buffer returns false if any block carries alpha
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&opaque_void);
+        combined.extend_from_slice(&rgb_block);
+        assert!(is_opaque(&combined));
+        combined.extend_from_slice(&alpha_void);
+        assert!(!is_opaque(&combined));
     }
 }
