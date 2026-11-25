@@ -81,6 +81,7 @@ impl Display {
     /// guest frames into the presenter's mailbox and keeping its shaders in `shader_cache`.
     pub fn renderer(
         &self,
+        program_id: u64,
         title: ConsoleGeneration,
         settings: &GraphicsSettings,
         shader_cache: Option<PathBuf>,
@@ -89,6 +90,7 @@ impl Display {
             self.device.clone(),
             self.mailbox.clone(),
             self.live.clone(),
+            program_id,
             title,
             settings,
             shader_cache,
@@ -139,6 +141,7 @@ pub(crate) fn vulkan_renderer(
     device: Arc<Device>,
     mailbox: Arc<FrameMailbox>,
     live: Arc<LiveSettings>,
+    program_id: u64,
     title: ConsoleGeneration,
     settings: &GraphicsSettings,
     shader_cache: Option<PathBuf>,
@@ -151,6 +154,7 @@ pub(crate) fn vulkan_renderer(
     Box::new(move |handles| {
         match VulkanRasterizer::new(&device, handles.clone(), mailbox, gob_layout) {
             Ok(mut rasterizer) => {
+                rasterizer.set_program_id(program_id);
                 rasterizer.apply_settings(&settings);
                 rasterizer.follow(live);
                 if let Some(dir) = &shader_cache

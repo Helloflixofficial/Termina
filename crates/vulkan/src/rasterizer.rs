@@ -11,6 +11,7 @@ mod direct_nvn;
 mod draw;
 mod fence_waiter;
 mod frame_dump;
+mod oot_network;
 mod samples;
 #[cfg(test)]
 mod submit_tests;
@@ -25,7 +26,9 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use lichii_common::DAddr;
-use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
+use lichii_common::settings::{
+    AstcRecompression, GraphicsSettings, OotAntiAliasing, ResolutionScale,
+};
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, CpuReadCompleter, CpuReadDone, CpuReadTicket, DrawParams,
@@ -226,6 +229,9 @@ pub struct VulkanRasterizer {
     texture_cache: ManuallyDrop<TextureCache>,
     buffer_cache: ManuallyDrop<BufferCache>,
     draw: draw::DrawState,
+    program_id: u64,
+    oot_anti_aliasing: OotAntiAliasing,
+    oot_bypass: oot_network::OotNetworkBypass,
     live: Option<Arc<LiveSettings>>,
     activity: Activity,
     stalls: Stalls,
@@ -462,6 +468,9 @@ impl VulkanRasterizer {
             conditions,
             unflushed: true,
             texture_cache: ManuallyDrop::new(texture_cache),
+            program_id: 0,
+            oot_anti_aliasing: OotAntiAliasing::Game,
+            oot_bypass: oot_network::OotNetworkBypass::default(),
             live: None,
             activity: Activity::default(),
             stalls: Stalls::default(),
@@ -492,11 +501,23 @@ impl VulkanRasterizer {
         Ok(())
     }
 
+    /// Sets the running title's program id, used for title-specific optimizations such as Ocarina
+    /// of Time's sharpening network bypass.
+    pub fn set_program_id(&mut self, program_id: u64) {
+        self.program_id = program_id;
+    }
+
+    fn oot_bypass_enabled(&self) -> bool {
+        self.program_id == oot_network::PROGRAM_ID
+            && self.oot_anti_aliasing == OotAntiAliasing::NoSharpening
+    }
+
     /// Applies the settings the renderer reads while running: the resolution scale render
     /// targets use from their next binding on, the ASTC fallback format of new textures and where
     /// they decode, how much device memory the texture cache may fill, sampler anisotropy and
     /// whether pipelines compile asynchronously.
     pub fn apply_settings(&mut self, settings: &GraphicsSettings) {
+        self.oot_anti_aliasing = settings.oot_anti_aliasing;
         self.draw.set_anisotropy(settings.anisotropic_filtering);
         self.draw
             .pipelines
@@ -824,6 +845,12 @@ impl VulkanRasterizer {
         }
         self.activity.submits += 1;
         self.log_activity();
+    }
+
+    fn flush_if_idle(&mut self) {
+        if self.unflushed && self.scheduler.idle_gpu_awaits_work() {
+            self.flush();
+        }
     }
 
     /// Submits the recorded work between operations once the oversized stream or staging
@@ -1263,6 +1290,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
+        self.flush_if_idle();
         self.bound_oversized();
         self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Direct(draw)) {
@@ -1271,6 +1299,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw) {
+        self.flush_if_idle();
         self.bound_oversized();
         self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Indirect(draw)) {
@@ -1279,6 +1308,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn draw_texture(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawTexture) {
+        self.flush_if_idle();
         self.bound_oversized();
         self.activity.texture_draws += 1;
         if let Err(error) = self.record_draw_texture(ctx, draw) {
@@ -1287,6 +1317,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32) {
+        self.flush_if_idle();
         self.bound_oversized();
         self.activity.clears += 1;
         if let Err(error) = self.clear_targets(ctx, layer_count) {
@@ -1295,6 +1326,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
+        self.flush_if_idle();
         self.bound_oversized();
         self.activity.dispatches += 1;
         if let Err(error) = self.dispatch(ctx) {

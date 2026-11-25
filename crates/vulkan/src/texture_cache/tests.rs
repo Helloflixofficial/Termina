@@ -69,7 +69,8 @@ impl Fixture {
         gmmu.map(GPU_VA, DADDR, dram, 0, false).unwrap();
         let written = Arc::new(GpuWrittenPages::new(36));
         let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
-        let mut cache = TextureCache::new(&device, written.clone(), lazy.clone(), gob, recompression);
+        let mut cache =
+            TextureCache::new(&device, written.clone(), lazy.clone(), gob, recompression);
         cache.set_opaque_astc_bc1(false);
         Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
@@ -2304,6 +2305,32 @@ fn collector_keeps_entries_work_in_flight_uses() {
 
     f.tick_budget(2, true);
     assert!(f.cache.get(recent).is_none() && !f.buffers.is_cached(BUFFER));
+    f.assert_no_validation_errors();
+}
+
+/// Below the memory budget thresholds a clean buffer unused for [`IDLE_BUFFER_AGE`] frames still
+/// gets collected, while a GPU-written buffer stays until downloaded.
+#[test]
+fn collector_evicts_idle_buffers_below_budget() {
+    const CLEAN: DAddr = DADDR + (32 << 20);
+    const WRITTEN: DAddr = DADDR + (48 << 20);
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    f.buffer(WRITTEN, 0x1_0000);
+    f.buffers
+        .mark_gpu_written(f.scheduler.tick(), WRITTEN, 0x100);
+    f.buffer(CLEAN, 0x1_0000);
+    for _ in 0..IDLE_BUFFER_AGE {
+        f.tick_budget(4 << 30, true);
+    }
+    assert!(f.buffers.is_cached(CLEAN), "not yet idle long enough");
+    assert!(f.buffers.is_cached(WRITTEN));
+
+    f.tick_budget(4 << 30, true);
+    assert!(!f.buffers.is_cached(CLEAN), "idle clean buffer evicted");
+    assert!(f.buffers.is_cached(WRITTEN), "GPU-written buffer kept");
+    assert_eq!(f.buffers.stats().evicted_buffers, 1);
     f.assert_no_validation_errors();
 }
 

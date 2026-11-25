@@ -313,6 +313,9 @@ impl ConfigWindow {
                     row(ui, "Anti-aliasing", |ui| {
                         combo(ui, "aa", &mut d.graphics.anti_aliasing)
                     });
+                    row(ui, "Ocarina of Time AA", |ui| {
+                        combo(ui, "oot aa", &mut d.graphics.oot_anti_aliasing)
+                    });
                     row(ui, "Aspect ratio", |ui| {
                         combo(ui, "aspect", &mut d.graphics.aspect_ratio)
                     });

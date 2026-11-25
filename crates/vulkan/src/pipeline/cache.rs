@@ -1037,9 +1037,9 @@ const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_PIPELINE_WORKERS: usize = 8;
 /// Cap for pipeline worker threads on constrained-RAM hosts (<= 10 GiB).
 const CONSTRAINED_PIPELINE_WORKERS: usize = 3;
-/// Runs whose pipelines the boot prebuild builds: the last two, so one short run (a boot to the
-/// menu, a crash) does not drop the run before it.
-const PREBUILD_RUNS: u16 = 2;
+/// Runs whose pipelines the boot prebuild builds: the last four, so short runs (menus,
+/// crashes, quick tests) do not drop recent gameplay and compute pipelines.
+const PREBUILD_RUNS: u16 = 4;
 /// Most pipelines the boot prebuild queues.
 const PREBUILD_LIMIT: usize = 2048;
 /// Boot prebuild cap on constrained-RAM hosts to bound driver cache memory.
@@ -1070,28 +1070,28 @@ enum StoredKey {
     Compute(usize),
 }
 
-/// The stored keys the boot prebuild queues: those used within the last [`PREBUILD_RUNS`]
-/// runs, most recent first, up to `limit`.
-fn prebuild_selection(stored: &Contents, limit: usize) -> Vec<StoredKey> {
-    let graphics = stored
-        .graphics
+/// Keys used within [`PREBUILD_RUNS`] runs, ordered most recent first.
+fn recent_keys<T>(entries: &[Aged<T>], wrap: fn(usize) -> StoredKey) -> Vec<(u16, StoredKey)> {
+    let mut recent: Vec<_> = entries
         .iter()
-        .map(|key| key.age)
         .enumerate()
-        .map(|(index, age)| (age, StoredKey::Graphics(index)));
-    let compute = stored
-        .compute
-        .iter()
-        .map(|key| key.age)
-        .enumerate()
-        .map(|(index, age)| (age, StoredKey::Compute(index)));
-    let mut selected: Vec<_> = graphics
-        .chain(compute)
-        .filter(|&(age, _)| age <= PREBUILD_RUNS)
+        .filter(|(_, key)| key.age <= PREBUILD_RUNS)
+        .map(|(index, key)| (key.age, wrap(index)))
         .collect();
-    selected.sort_by_key(|&(age, _)| age);
-    selected.truncate(limit);
-    selected.into_iter().map(|(_, key)| key).collect()
+    recent.sort_by_key(|&(age, _)| age);
+    recent
+}
+
+/// The stored keys the boot prebuild queues: compute pipelines from the last [`PREBUILD_RUNS`]
+/// runs first (compute misses stall dispatch synchronously, whereas graphics draws skip while
+/// compiling asynchronously), then recent graphics pipelines, up to `limit`.
+fn prebuild_selection(stored: &Contents, limit: usize) -> Vec<StoredKey> {
+    recent_keys(&stored.compute, StoredKey::Compute)
+        .into_iter()
+        .chain(recent_keys(&stored.graphics, StoredKey::Graphics))
+        .take(limit)
+        .map(|(_, key)| key)
+        .collect()
 }
 
 fn identity(device: &Device) -> DeviceIdentity {
@@ -3208,17 +3208,17 @@ mod tests {
         };
         assert_eq!(
             prebuild_selection(
-                &contents(&[3, 1, disk::UNRECORDED_AGE, 2, 1], &[2, 1, KEEP_RUNS]),
+                &contents(&[5, 1, disk::UNRECORDED_AGE, 2, 1], &[2, 1, KEEP_RUNS]),
                 PREBUILD_LIMIT,
             ),
             [
+                Compute(1),
+                Compute(0),
                 Graphics(1),
                 Graphics(4),
-                Compute(1),
                 Graphics(3),
-                Compute(0)
             ],
-            "keys from the last two runs, the last run's first"
+            "compute keys first, then graphics keys from recent runs, most recent first"
         );
         let selected =
             prebuild_selection(&contents(&[2; PREBUILD_LIMIT], &[1; 10]), PREBUILD_LIMIT);
@@ -3228,7 +3228,12 @@ mod tests {
                 .map(Compute)
                 .chain((0..PREBUILD_LIMIT - 10).map(Graphics))
                 .collect::<Vec<_>>(),
-            "the cap keeps the most recent keys"
+            "the cap keeps compute keys ahead of graphics keys"
+        );
+        assert_eq!(
+            prebuild_selection(&contents(&[0, 0], &[3, 2]), 2),
+            [Compute(1), Compute(0)],
+            "older recent compute keys take priority over newer graphics keys at tight limits"
         );
     }
 

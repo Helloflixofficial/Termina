@@ -957,6 +957,9 @@ impl VulkanRasterizer {
         if !self.graphics_stages(ctx, host_topology, may_skip) {
             return Ok(());
         }
+        if self.oot_bypass_enabled() {
+            self.oot_bypass.track_render_target(&regs.rt[0]);
+        }
 
         let draw = &mut self.draw;
         let mut fixed = *draw
@@ -2705,6 +2708,25 @@ impl VulkanRasterizer {
     }
 
     pub(super) fn dispatch(&mut self, ctx: &ComputeContext<'_>) -> Result<()> {
+        if self.oot_bypass_enabled() && ctx.qmd_version == lichii_gpu::backend::QmdVersion::V3 {
+            let generation = self.draw.shaders.generation();
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+                buffers: &mut self.buffer_cache,
+            };
+            if self.oot_bypass.try_bypass(
+                ctx,
+                self.gob_layout,
+                generation,
+                &mut self.texture_cache,
+                &mut tx,
+            )? {
+                self.unflushed = true;
+                return Ok(());
+            }
+        }
         let env = ProgramEnv::compute(ctx);
         let mut bindings = Bindings::default();
         let Some((_, module)) =

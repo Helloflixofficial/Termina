@@ -83,6 +83,7 @@ choices!(ScalingFilter {
     Mmpx => "MMPX",
 });
 choices!(AntiAliasing { None => "None", Fxaa => "FXAA", Smaa => "SMAA" });
+choices!(OotAntiAliasing { Game => "Game", NoSharpening => "No sharpening" });
 choices!(AspectRatio {
     R16x9 => "Default (16:9)",
     R4x3 => "Force 4:3",

@@ -59,8 +59,164 @@ struct ModDir {
 pub struct Mods {
     mods: Vec<ModDir>,
     program_id: u64,
+    disabled: Vec<String>,
     builtin_patches: bool,
     mkw_dynamic_fps: bool,
+}
+
+/// One toggleable add-on or mod shown in the title's Add-Ons tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddonEntry {
+    pub name: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub off_by_default: bool,
+    pub description: String,
+}
+
+/// Returns all user mods and built-in add-ons for `program_id` together with their enabled state.
+pub fn list_addons(options: &ModOptions, program_id: u64) -> LoaderResult<Vec<AddonEntry>> {
+    let mut out = Vec::new();
+    let title = format!("{program_id:016X}");
+    let is_disabled = |name: &str| options.disabled.iter().any(|d| d == name);
+
+    if let Some(root) = options.load_root.as_deref().filter(|p| p.is_dir())
+        && let Some(title_dir) = find_caseless(HostDir::open(root)?.as_ref(), &title)?
+    {
+        let mut entries = title_dir.entries()?;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            if entry.kind == EntryKind::File && entry.name.starts_with("cheat_") {
+                out.push(AddonEntry {
+                    enabled: !is_disabled(&entry.name),
+                    name: entry.name,
+                    kind: "Cheats".to_owned(),
+                    off_by_default: false,
+                    description: String::new(),
+                });
+                continue;
+            }
+            if entry.kind != EntryKind::Directory {
+                continue;
+            }
+            let Some(dir) = title_dir.open_dir(&entry.name)? else {
+                continue;
+            };
+            let types = detect_mod_types(dir.as_ref())?;
+            if types.is_empty() {
+                continue;
+            }
+            out.push(AddonEntry {
+                enabled: !is_disabled(&entry.name),
+                name: entry.name,
+                kind: types,
+                off_by_default: false,
+                description: String::new(),
+            });
+        }
+    }
+
+    if let Some(sdmc) = options.sdmc_root.as_deref() {
+        let contents = sdmc.join("atmosphere").join("contents");
+        if contents.is_dir()
+            && let Some(dir) = find_caseless(HostDir::open(&contents)?.as_ref(), &title)?
+        {
+            let types = detect_mod_types(dir.as_ref())?;
+            if !types.is_empty() {
+                out.push(AddonEntry {
+                    enabled: !is_disabled("SDMC"),
+                    name: "SDMC".to_owned(),
+                    kind: types,
+                    off_by_default: false,
+                    description: String::new(),
+                });
+            }
+        }
+    }
+
+    for patch in builtin::list_for_title(program_id) {
+        let enabled = builtin::is_enabled(patch.name, patch.off_by_default, &options.disabled);
+        let kind = match patch.replaces {
+            Some(replacer) if !is_disabled(replacer) => {
+                format!("IPS, replaced by {replacer} when it applies")
+            }
+            _ => "IPS".to_owned(),
+        };
+        out.push(AddonEntry {
+            name: patch.name.to_owned(),
+            kind,
+            enabled,
+            off_by_default: patch.off_by_default,
+            description: patch.description.to_owned(),
+        });
+    }
+
+    Ok(out)
+}
+
+/// Converts a list of [`AddonEntry`] states into the sparse `disabled` list saved on disk.
+pub fn encode_disabled_addons(addons: &[AddonEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    for addon in addons {
+        if addon.off_by_default {
+            if addon.enabled {
+                out.push(builtin::enabled_addon_key(&addon.name));
+            }
+        } else if !addon.enabled {
+            out.push(addon.name.clone());
+        }
+    }
+    out
+}
+
+fn dir_non_empty(dir: Option<DirRef>) -> LoaderResult<bool> {
+    Ok(match dir {
+        Some(d) => !d.entries()?.is_empty(),
+        None => false,
+    })
+}
+
+fn detect_mod_types(dir: &dyn Directory) -> LoaderResult<String> {
+    let mut types = Vec::new();
+    if let Some(exefs) = find_caseless(dir, "exefs")? {
+        let entries = exefs.entries()?;
+        if !entries.is_empty() {
+            let mut ips = false;
+            let mut ipswitch = false;
+            let mut layered = false;
+            for entry in entries {
+                let lower = entry.name.to_ascii_lowercase();
+                if lower.ends_with(".ips") {
+                    ips = true;
+                } else if lower.ends_with(".pchtxt") {
+                    ipswitch = true;
+                } else if entry.kind == EntryKind::File {
+                    layered = true;
+                }
+            }
+            if ips {
+                types.push("IPS");
+            }
+            if ipswitch {
+                types.push("IPSwitch");
+            }
+            if layered {
+                types.push("LayeredExeFS");
+            }
+        }
+    }
+    if dir_non_empty(find_caseless(dir, "romfs")?)?
+        || dir_non_empty(find_caseless(dir, "romfslite")?)?
+    {
+        types.push("LayeredFS");
+    }
+    if dir_non_empty(find_caseless(dir, "romfs_ext")?)? {
+        types.push("ExtLayeredFS");
+    }
+    if dir_non_empty(find_caseless(dir, "cheats")?)? {
+        types.push("Cheats");
+    }
+    Ok(types.join(", "))
 }
 
 impl Mods {
@@ -108,6 +264,7 @@ impl Mods {
                 .filter(|m| !options.disabled.contains(&m.name))
                 .collect(),
             program_id,
+            disabled: options.disabled.clone(),
             builtin_patches: options.builtin_patches,
             mkw_dynamic_fps: options.mkw_dynamic_fps,
         })
@@ -198,7 +355,7 @@ impl Mods {
                 std::mem::replace(&mut module.image, target)
             });
             if self.builtin_patches {
-                builtin::apply(self.program_id, module, original.as_deref());
+                builtin::apply(self.program_id, module, original.as_deref(), &self.disabled);
             }
         }
         let dynamic_fps = self.mkw_dynamic_fps

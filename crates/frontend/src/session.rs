@@ -615,6 +615,7 @@ mod tests {
                 device.clone(),
                 Arc::default(),
                 Arc::default(),
+                0x0100_0000_0000_1000,
                 ConsoleGeneration::Switch1,
                 &settings.graphics,
                 Some(cache.clone()),

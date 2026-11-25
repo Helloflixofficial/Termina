@@ -23,9 +23,10 @@ pub mod testing;
 pub mod title;
 pub mod zstd;
 
+pub use crate::builtin::enabled_addon_key;
 pub use crate::error::{LoaderError, LoaderResult};
 pub use crate::npdm::Npdm;
-pub use crate::patch::{ModOptions, Mods};
+pub use crate::patch::{AddonEntry, ModOptions, Mods, encode_disabled_addons, list_addons};
 pub use crate::program::{
     AddOnContent, MainThread, Mod0, Module, Permission, ProgramImage, Segment,
 };

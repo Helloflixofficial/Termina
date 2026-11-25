@@ -206,7 +206,7 @@ impl TexturePool {
     }
 
     /// The entry a raw handle selects, `None` past the pool or where it is unmapped.
-    fn entry(&self, gmmu: &Gmmu, raw: u32) -> Option<TicEntry> {
+    pub(crate) fn entry(&self, gmmu: &Gmmu, raw: u32) -> Option<TicEntry> {
         let (index, _) = self.split(raw);
         if index > self.limit {
             return None;

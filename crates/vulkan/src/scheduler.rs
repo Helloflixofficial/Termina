@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use lichii_gpu::activity::{Activity, Wait};
@@ -65,6 +66,10 @@ pub struct Scheduler {
     compute_barrier_owed: bool,
     /// Compute barriers recorded so far.
     compute_barriers: u64,
+    /// When the last queue submission happened, for idle GPU early submits.
+    last_flush: Instant,
+    /// Rate limit on polling the timeline semaphore while the GPU stays busy.
+    next_idle_check: Instant,
 }
 
 /// The attachments and area of a dynamic rendering. Draws whose key matches the open
@@ -113,6 +118,7 @@ impl Scheduler {
                 .create_command_pool(&pool_info, None)
                 .call("vkCreateCommandPool")?
         };
+        let now = Instant::now();
         Ok(Self {
             device: device.clone(),
             timeline,
@@ -137,6 +143,8 @@ impl Scheduler {
             signal_infos: Vec::new(),
             compute_barrier_owed: false,
             compute_barriers: 0,
+            last_flush: now,
+            next_idle_check: now,
         })
     }
 
@@ -468,10 +476,26 @@ impl Scheduler {
             .signal_semaphore_infos(signals);
         self.submits += 1;
         self.device.submit(&[submit], vk::Fence::null())?;
+        self.last_flush = Instant::now();
         if let Some(cmd) = cmd {
             self.in_flight.push_back((self.tick, cmd));
         }
         Ok(())
+    }
+
+    /// Whether the last submission is old enough (>= 100 us), the host GPU has finished all prior
+    /// submissions, and recorded work is sitting waiting outside an active render pass.
+    pub fn idle_gpu_awaits_work(&mut self) -> bool {
+        const IDLE_AGE: Duration = Duration::from_micros(100);
+        if self.rendering.is_some() || !self.recorded || self.tick <= 1 {
+            return false;
+        }
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_flush) < IDLE_AGE || now < self.next_idle_check {
+            return false;
+        }
+        self.next_idle_check = now + IDLE_AGE;
+        self.is_complete(self.tick - 1)
     }
 
     /// Binds sparse memory to `image` after the work recorded so far and before any recorded
@@ -844,6 +868,23 @@ mod tests {
             barriers + 2,
             "a part submission ends with the owed compute barrier"
         );
+        scheduler.finish().unwrap();
+        assert_eq!(device.instance().validation_errors(), 0);
+    }
+
+    #[test]
+    fn idle_gpu_awaits_work_only_outside_rendering_after_flush_age() {
+        let Some(device) = device() else { return };
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        assert!(!scheduler.idle_gpu_awaits_work());
+        scheduler.record().unwrap();
+        // No submission yet (tick == 1), so nothing awaits on GPU.
+        assert!(!scheduler.idle_gpu_awaits_work());
+        scheduler.finish().unwrap();
+        // After a completed flush, recording outside a pass waits at least IDLE_AGE (100 us).
+        scheduler.record().unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(scheduler.idle_gpu_awaits_work());
         scheduler.finish().unwrap();
         assert_eq!(device.instance().validation_errors(), 0);
     }

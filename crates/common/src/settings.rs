@@ -416,6 +416,7 @@ pub struct GraphicsSettings {
     /// FSR sharpening, 0 (none) to 100 (most).
     pub fsr_sharpness: u8,
     pub anti_aliasing: AntiAliasing,
+    pub oot_anti_aliasing: OotAntiAliasing,
     pub aspect_ratio: AspectRatio,
     pub present_mode: PresentMode,
     pub fullscreen: FullscreenMode,
@@ -445,6 +446,7 @@ impl Default for GraphicsSettings {
             scaling_filter: ScalingFilter::Fsr,
             fsr_sharpness: 25,
             anti_aliasing: AntiAliasing::None,
+            oot_anti_aliasing: OotAntiAliasing::Game,
             aspect_ratio: AspectRatio::R16x9,
             present_mode: PresentMode::Mailbox,
             fullscreen: FullscreenMode::Borderless,
@@ -565,6 +567,14 @@ pub enum AntiAliasing {
     None,
     Fxaa,
     Smaa,
+}
+
+/// Ocarina of Time post-tonemap anti-aliasing network handling.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OotAntiAliasing {
+    #[default]
+    Game,
+    NoSharpening,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

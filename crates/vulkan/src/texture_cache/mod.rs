@@ -100,6 +100,9 @@ const NIL: u32 = u32::MAX;
 /// is under the retention line (images of the last few seconds stay) and past it.
 const OLD_AGE: u64 = 150;
 const RECENT_AGE: u64 = 10;
+/// Frames a cached buffer may sit unused before being collected below budget thresholds (~60 s
+/// at 60 FPS), freeing menu/loading buffers without touching active GPU-written data.
+const IDLE_BUFFER_AGE: u64 = 3600;
 /// Frames an image or buffer must go unused before the collector may evict it while the
 /// caches hold more than their own budget's expected line ([`CacheBudget`]).
 const BUDGET_AGE: u64 = 30;
@@ -4868,6 +4871,7 @@ impl TextureCache {
         let budget = CacheBudget::new(usage.device_local, self.vram_usage);
         self.budget = budget;
         if used < limits.expected && cached < budget.expected {
+            self.collect_idle_buffers(tx);
             return Ok(());
         }
         let mut aggressive = used >= limits.critical || cached >= budget.critical;
@@ -4964,6 +4968,29 @@ impl TextureCache {
             bytes: queued_bytes,
         });
         Ok(())
+    }
+
+    /// Collects buffers unused for [`IDLE_BUFFER_AGE`] frames even below the memory budget
+    /// thresholds so stale menu/video buffers do not accumulate.
+    fn collect_idle_buffers(&mut self, tx: &mut Transfer<'_>) {
+        let unused_before = self.unused_before(IDLE_BUFFER_AGE);
+        let mut evictions = NORMAL_EVICTIONS;
+        let mut visits = NORMAL_EVICTIONS * VISITS_PER_EVICTION;
+        let mut buffer = tx.buffers.lru_head();
+        while evictions > 0 && visits > 0 {
+            let Some((last_use, next)) = tx.buffers.lru_entry(buffer) else {
+                break;
+            };
+            if last_use >= unused_before {
+                break;
+            }
+            visits -= 1;
+            let at = buffer;
+            buffer = next;
+            if tx.buffers.evict(tx.scheduler, at).is_some() {
+                evictions -= 1;
+            }
+        }
     }
 
     /// The first frame whose entries the collector keeps when it evicts entries unused for

@@ -16,6 +16,8 @@ pub const KEYS: &[&str] = &[
     "system.memory_layout",
     "system.time_zone",
     "system.network_enabled",
+    "system.builtin_game_patches",
+    "system.mkw_dynamic_fps",
     "cpu.backend",
     "cpu.accuracy",
     "cpu.fastmem",
@@ -23,7 +25,9 @@ pub const KEYS: &[&str] = &[
     "graphics.scaling_filter",
     "graphics.fsr_sharpness",
     "graphics.anti_aliasing",
+    "graphics.oot_anti_aliasing",
     "graphics.aspect_ratio",
+    "graphics.present_mode",
     "graphics.speed_limit",
     "graphics.gpu_accuracy",
     "graphics.anisotropic_filtering",
@@ -84,7 +88,20 @@ impl GameConfig {
                 _ => tracing::warn!("{}: {key} = {value} is not a valid value", path.display()),
             }
         }
-        Self { path, overrides }
+        let mut config = Self { path, overrides };
+        if let Some(disabled) = parsed
+            .get("addons")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("disabled"))
+            .and_then(toml::Value::as_array)
+        {
+            let valid: Vec<String> = disabled
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            config.set_disabled_addons(valid);
+        }
+        config
     }
 
     pub fn file(&self) -> &Path {
@@ -92,7 +109,37 @@ impl GameConfig {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.overridden().is_empty()
+        self.overridden().is_empty() && self.disabled_addons().is_empty()
+    }
+
+    /// Add-on toggle entries saved for this title (`"Name"` disables a default-on add-on,
+    /// `"+Name"` enables an `off_by_default` add-on).
+    pub fn disabled_addons(&self) -> Vec<String> {
+        self.overrides
+            .get("addons")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("disabled"))
+            .and_then(toml::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Updates the saved per-game add-on state.
+    pub fn set_disabled_addons(&mut self, disabled: Vec<String>) {
+        if disabled.is_empty() {
+            self.overrides.remove("addons");
+            return;
+        }
+        let values = disabled.into_iter().map(toml::Value::String).collect();
+        let mut section = toml::Table::new();
+        section.insert("disabled".to_owned(), toml::Value::Array(values));
+        self.overrides
+            .insert("addons".to_owned(), toml::Value::Table(section));
     }
 
     /// The settings this game overrides.
@@ -114,14 +161,19 @@ impl GameConfig {
         parse(&merged).map_or_else(|| global.clone(), |(settings, _)| settings)
     }
 
-    /// Makes `keys` the overridden settings, with their values from `settings`.
+    /// Makes `keys` the overridden settings, with their values from `settings`, preserving any
+    /// per-game add-on toggles.
     pub fn set_overrides(&mut self, settings: &Settings, keys: &BTreeSet<&'static str>) {
+        let addons = self.overrides.remove("addons");
         let source = table(settings);
         self.overrides = toml::Table::new();
         for key in keys {
             if let Some(value) = get(&source, key) {
                 set(&mut self.overrides, key, value.clone());
             }
+        }
+        if let Some(addons) = addons {
+            self.overrides.insert("addons".to_owned(), addons);
         }
     }
 
@@ -365,5 +417,42 @@ mod tests {
             global.graphics.resolution_scale
         );
         assert_ne!(draft.cpu.fastmem, global.cpu.fastmem);
+    }
+
+    #[test]
+    fn addon_toggles_round_trip_and_survive_settings_updates() {
+        let tmp = TempDir::new("addons");
+        let path = GameConfig::path(&tmp.0, 0x0400_4860_24DE_C000, Path::new("OoT.nup"));
+        let mut config = GameConfig::load(path.clone());
+        assert!(config.is_empty());
+
+        config.set_disabled_addons(vec![
+            "Dynamic FPS by Dark (built-in)".to_owned(),
+            "+Text Speed Instant (built-in)".to_owned(),
+        ]);
+        assert!(!config.is_empty());
+        let mut game = Settings::default();
+        game.graphics.resolution_scale = ResolutionScale::X2;
+        config.set_overrides(&game, &BTreeSet::from(["graphics.resolution_scale"]));
+        config.save().unwrap();
+
+        let reloaded = GameConfig::load(path.clone());
+        assert_eq!(
+            reloaded.disabled_addons(),
+            vec![
+                "Dynamic FPS by Dark (built-in)",
+                "+Text Speed Instant (built-in)",
+            ]
+        );
+        assert_eq!(
+            reloaded.overridden(),
+            BTreeSet::from(["graphics.resolution_scale"])
+        );
+
+        let mut cleared = reloaded;
+        cleared.set_overrides(&game, &BTreeSet::new());
+        cleared.set_disabled_addons(Vec::new());
+        cleared.save().unwrap();
+        assert!(!path.exists());
     }
 }

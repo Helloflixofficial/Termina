@@ -1,16 +1,19 @@
-//! The per-game Properties window: settings a game overrides, each with a Custom toggle; the
-//! rest follow the global configuration.
+//! The per-game Properties window: Add-Ons and settings a game overrides, each with a Custom
+//! toggle; the rest follow the global configuration.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use egui::{RichText, Ui};
 use lichii_common::settings::{ScalingFilter, Settings};
+use lichii_loader::{AddonEntry, ModOptions, encode_disabled_addons, list_addons};
 
 use super::{combo, docked_toggle, note, section, speed_limit, time_zone};
 use crate::per_game::{self, GameConfig, copy_key};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
+    AddOns,
     System,
     Cpu,
     Graphics,
@@ -18,10 +21,17 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Self; 4] = [Self::System, Self::Cpu, Self::Graphics, Self::Audio];
+    const ALL: [Self; 5] = [
+        Self::AddOns,
+        Self::System,
+        Self::Cpu,
+        Self::Graphics,
+        Self::Audio,
+    ];
 
     fn label(self) -> &'static str {
         match self {
+            Self::AddOns => "Add-Ons",
             Self::System => "System",
             Self::Cpu => "CPU",
             Self::Graphics => "Graphics",
@@ -37,6 +47,10 @@ pub struct GameConfigWindow {
     /// The settings the game would run with: global, with the custom ones edited.
     draft: Settings,
     custom: BTreeSet<&'static str>,
+    addons: Vec<AddonEntry>,
+    shader_cache: Option<PathBuf>,
+    shader_cache_bytes: u64,
+    shader_cache_status: Option<String>,
     page: Page,
 }
 
@@ -48,14 +62,33 @@ pub struct GameConfigOutput {
 }
 
 impl GameConfigWindow {
-    pub fn new(title: String, program_id: u64, config: GameConfig, global: &Settings) -> Self {
+    pub fn new(
+        title: String,
+        program_id: u64,
+        config: GameConfig,
+        global: &Settings,
+        mod_options: &ModOptions,
+        shader_cache: Option<PathBuf>,
+    ) -> Self {
+        let mut opts = mod_options.clone();
+        opts.disabled = config.disabled_addons();
+        let addons = if program_id != 0 {
+            list_addons(&opts, program_id).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let shader_cache_bytes = shader_cache.as_deref().map_or(0, dir_size_bytes);
         Self {
             title,
             program_id,
             draft: config.apply(global),
             custom: config.overridden(),
             config,
-            page: Page::System,
+            addons,
+            shader_cache,
+            shader_cache_bytes,
+            shader_cache_status: None,
+            page: Page::AddOns,
         }
     }
 
@@ -69,7 +102,7 @@ impl GameConfigWindow {
         let mut open = true;
         egui::Window::new(format!("Properties: {}", self.title))
             .open(&mut open)
-            .default_size([720.0, 560.0])
+            .default_size([740.0, 560.0])
             .collapsible(false)
             .show(ctx, |ui| {
                 egui::Panel::bottom("game config buttons").show(ui, |ui| {
@@ -110,11 +143,15 @@ impl GameConfigWindow {
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .auto_shrink(false)
-                        .show(ui, |ui| self.page_ui(ui, global));
+                        .show(ui, |ui| self.page_ui(ui, global, running));
                     if running {
                         note(
                             ui,
-                            "Graphics changes reach the running game on Apply; the rest apply the next time it starts.",
+                            if self.page == Page::AddOns {
+                                "Restart the game to apply Add-On changes."
+                            } else {
+                                "Graphics changes reach the running game on Apply; the rest apply the next time it starts."
+                            },
                         );
                     }
                 });
@@ -134,6 +171,8 @@ impl GameConfigWindow {
 
     fn save(&mut self) -> bool {
         self.config.set_overrides(&self.draft, &self.custom);
+        self.config
+            .set_disabled_addons(encode_disabled_addons(&self.addons));
         match self.config.save() {
             Ok(()) => true,
             Err(e) => {
@@ -143,13 +182,61 @@ impl GameConfigWindow {
         }
     }
 
-    fn page_ui(&mut self, ui: &mut Ui, global: &Settings) {
+    fn clear_shader_cache(&mut self) {
+        let Some(dir) = &self.shader_cache else {
+            return;
+        };
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                self.shader_cache_bytes = 0;
+                self.shader_cache_status = Some("Cleared shader cache.".into());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.shader_cache_bytes = 0;
+                self.shader_cache_status = Some("Shader cache was already empty.".into());
+            }
+            Err(e) => {
+                self.shader_cache_bytes = dir_size_bytes(dir);
+                self.shader_cache_status = Some(format!("Could not clear shader cache: {e}"));
+            }
+        }
+    }
+
+    fn page_ui(&mut self, ui: &mut Ui, global: &Settings, running: bool) {
+        if self.page == Page::AddOns {
+            section(ui, "Add-Ons and Mods");
+            if self.addons.is_empty() {
+                note(ui, "No mods or built-in add-ons found for this title.");
+                return;
+            }
+            egui::Grid::new("game addons")
+                .num_columns(2)
+                .spacing([24.0, 6.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Patch Name").strong());
+                    ui.label(RichText::new("Type").strong());
+                    ui.end_row();
+                    for addon in &mut self.addons {
+                        let cb = ui.checkbox(&mut addon.enabled, &addon.name);
+                        let kind = ui.label(RichText::new(&addon.kind).weak());
+                        if !addon.description.is_empty() {
+                            cb.on_hover_text(&addon.description);
+                            kind.on_hover_text(&addon.description);
+                        }
+                        ui.end_row();
+                    }
+                });
+            return;
+        }
+
         let mut rows = Rows {
             custom: &mut self.custom,
             draft: &mut self.draft,
             global,
         };
         match self.page {
+            Page::AddOns => unreachable!(),
             Page::System => {
                 section(ui, "Console");
                 rows.grid(ui, "game system", |ui, r| {
@@ -179,6 +266,17 @@ impl GameConfigWindow {
                     r.row(ui, "system.network_enabled", "Network", |ui, d| {
                         ui.checkbox(&mut d.system.network_enabled, "Allow the game to go online");
                     });
+                    r.row(
+                        ui,
+                        "system.builtin_game_patches",
+                        "Built-in patches",
+                        |ui, d| {
+                            ui.checkbox(
+                                &mut d.system.builtin_game_patches,
+                                "Apply Lichii's built-in patches for known builds",
+                            );
+                        },
+                    );
                 });
             }
             Page::Cpu => {
@@ -213,8 +311,19 @@ impl GameConfigWindow {
                     r.row(ui, "graphics.anti_aliasing", "Anti-aliasing", |ui, d| {
                         combo(ui, "game aa", &mut d.graphics.anti_aliasing);
                     });
+                    r.row(
+                        ui,
+                        "graphics.oot_anti_aliasing",
+                        "Ocarina of Time AA",
+                        |ui, d| {
+                            combo(ui, "game oot aa", &mut d.graphics.oot_anti_aliasing);
+                        },
+                    );
                     r.row(ui, "graphics.aspect_ratio", "Aspect ratio", |ui, d| {
                         combo(ui, "game aspect", &mut d.graphics.aspect_ratio);
+                    });
+                    r.row(ui, "graphics.present_mode", "VSync mode", |ui, d| {
+                        combo(ui, "game present mode", &mut d.graphics.present_mode);
                     });
                     r.row(ui, "graphics.speed_limit", "Speed", |ui, d| {
                         speed_limit(ui, &mut d.graphics.speed_limit);
@@ -272,6 +381,30 @@ impl GameConfigWindow {
                         );
                     });
                 });
+                if self.shader_cache.is_some() {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Cached on disk: {}",
+                            format_bytes(self.shader_cache_bytes)
+                        ));
+                        let clear_btn = ui.add_enabled(
+                            !running && self.shader_cache_bytes > 0,
+                            egui::Button::new("Clear Shader Cache"),
+                        );
+                        let clear_btn = if running {
+                            clear_btn.on_hover_text("Stop the running game before clearing its shader cache.")
+                        } else {
+                            clear_btn.on_hover_text("Remove compiled shaders and pipelines cached on disk for this title.")
+                        };
+                        if clear_btn.clicked() {
+                            self.clear_shader_cache();
+                        }
+                    });
+                    if let Some(status) = &self.shader_cache_status {
+                        note(ui, status);
+                    }
+                }
             }
             Page::Audio => {
                 section(ui, "Audio");
@@ -333,6 +466,35 @@ impl Rows<'_> {
     }
 }
 
+fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?)))
+        .map(|(entry_path, meta)| {
+            if meta.is_dir() {
+                dir_size_bytes(&entry_path)
+            } else {
+                meta.len()
+            }
+        })
+        .sum()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,7 +503,14 @@ mod tests {
     #[test]
     fn outside_changes_follow_into_the_draft_without_undoing_its_edits() {
         let global = Settings::default();
-        let mut window = GameConfigWindow::new("Game".into(), 1, GameConfig::default(), &global);
+        let mut window = GameConfigWindow::new(
+            "Game".into(),
+            1,
+            GameConfig::default(),
+            &global,
+            &ModOptions::default(),
+            None,
+        );
         window.custom.insert("cpu.accuracy");
         window.draft.cpu.accuracy = CpuAccuracy::Paranoid;
 
@@ -351,5 +520,32 @@ mod tests {
 
         assert_eq!(window.draft.graphics.resolution_scale, ResolutionScale::X2);
         assert_eq!(window.draft.cpu.accuracy, CpuAccuracy::Paranoid);
+    }
+
+    #[test]
+    fn clear_shader_cache_removes_files_and_updates_size() {
+        let dir = std::env::temp_dir().join(format!("lichii-gamecfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shaders.bin"), vec![1u8; 4096]).unwrap();
+        std::fs::write(dir.join("pipelines.bin"), vec![2u8; 2048]).unwrap();
+
+        let global = Settings::default();
+        let mut window = GameConfigWindow::new(
+            "Game".into(),
+            1,
+            GameConfig::default(),
+            &global,
+            &ModOptions::default(),
+            Some(dir.clone()),
+        );
+        assert_eq!(window.shader_cache_bytes, 6144);
+        window.clear_shader_cache();
+        assert_eq!(window.shader_cache_bytes, 0);
+        assert!(!dir.exists());
+        assert_eq!(
+            window.shader_cache_status.as_deref(),
+            Some("Cleared shader cache.")
+        );
     }
 }

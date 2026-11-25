@@ -529,6 +529,29 @@ impl App {
         }
         self.end_session();
         let config_dir = self.config_dir();
+        let keys = Some(self.keys());
+        let installed = self.installed_content();
+        let pre_mods = if without_custom {
+            self.mod_options(&self.settings, Vec::new())
+        } else {
+            let program_id = self
+                .games
+                .entries
+                .iter()
+                .find(|g| g.path == path)
+                .and_then(|g| g.meta.as_ref().map(|m| m.program_id))
+                .unwrap_or_else(|| {
+                    let probe = LoadOptions {
+                        keys: keys.clone(),
+                        installed: installed.clone(),
+                        ..LoadOptions::default()
+                    };
+                    lichii_loader::scan(&path, &probe).map_or(0, |info| info.program_id)
+                });
+            let config = GameConfig::load(GameConfig::path(&config_dir, program_id, &path));
+            let effective = config.apply(&self.settings);
+            self.mod_options(&effective, config.disabled_addons())
+        };
         let mut running = None;
         let configure = |program_id, title| {
             let config = GameConfig::load(GameConfig::path(&config_dir, program_id, &path));
@@ -542,6 +565,7 @@ impl App {
             let host = Host {
                 renderer: match &self.display {
                     Some(display) => display.renderer(
+                        program_id,
                         title,
                         &settings.graphics,
                         crate::display::shader_cache_dir(&self.paths, program_id),
@@ -554,13 +578,9 @@ impl App {
             (Arc::new(settings.clone()), host)
         };
         let options = LoadOptions {
-            keys: Some(self.keys()),
-            installed: self.installed_content(),
-            mods: ModOptions {
-                builtin_patches: self.settings.system.builtin_game_patches,
-                mkw_dynamic_fps: self.settings.system.mkw_dynamic_fps,
-                ..ModOptions::default()
-            },
+            keys,
+            installed,
+            mods: pre_mods,
             ..LoadOptions::default()
         };
         let proxy = self.proxy.clone();
@@ -748,13 +768,38 @@ Dump prod.keys and title.keys \
         }
     }
 
+    fn mod_options(&self, settings: &Settings, disabled: Vec<String>) -> ModOptions {
+        ModOptions {
+            load_root: Some(
+                settings
+                    .paths
+                    .mods_dir
+                    .clone()
+                    .unwrap_or_else(|| self.paths.data_dir.join("load")),
+            ),
+            sdmc_root: Some(
+                settings
+                    .paths
+                    .sdmc_dir
+                    .clone()
+                    .unwrap_or_else(|| self.paths.sdmc_dir()),
+            ),
+            disabled,
+            builtin_patches: settings.system.builtin_game_patches,
+            mkw_dynamic_fps: settings.system.mkw_dynamic_fps,
+        }
+    }
+
     fn open_game_config(&mut self, path: &Path, program_id: u64, title: String) {
         let config = GameConfig::load(GameConfig::path(&self.config_dir(), program_id, path));
+        let mod_options = self.mod_options(&self.settings, config.disabled_addons());
         self.game_config = Some(GameConfigWindow::new(
             title,
             program_id,
             config,
             &self.settings,
+            &mod_options,
+            crate::display::shader_cache_dir(&self.paths, program_id),
         ));
     }
 
