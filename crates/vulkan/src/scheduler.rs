@@ -421,13 +421,18 @@ impl Scheduler {
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
+        const WAIT_SLICE_NS: u64 = 100_000_000;
         let _waiting = self.activity.as_deref().map(|a| a.waiting(Wait::HostGpu));
-        // SAFETY: the semaphore belongs to this scheduler and `part` was submitted.
-        unsafe {
-            self.device
-                .raw
-                .wait_semaphores(&info, u64::MAX)
-                .call("vkWaitSemaphores")
+        loop {
+            if crate::debug::device_is_lost() {
+                return Err(Error::DeviceLost);
+            }
+            // SAFETY: the semaphore belongs to this scheduler and `part` was submitted.
+            match unsafe { self.device.raw.wait_semaphores(&info, WAIT_SLICE_NS) } {
+                Ok(()) => return Ok(()),
+                Err(vk::Result::TIMEOUT) => continue,
+                Err(err) => return Err(err).call("vkWaitSemaphores"),
+            }
         }
     }
 

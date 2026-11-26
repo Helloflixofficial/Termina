@@ -15,15 +15,24 @@ use crate::game_list::{GameEntry, format_size};
 const GAME_ICON: f32 = 40.0;
 
 /// A game's right-click menu, as in Lichii's game list.
-fn game_menu(ui: &mut Ui, entry: &GameEntry, actions: &mut Vec<Action>) {
+fn game_menu(ui: &mut Ui, entry: &GameEntry, favorite: bool, actions: &mut Vec<Action>) {
     let path = &entry.path;
     let program_id = entry.meta.as_ref().map_or(0, |m| m.program_id);
-    let mut pick = |ui: &mut Ui, enabled: bool, label: &str, action: Action| {
-        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+    let known = entry.meta.is_some();
+    let mut pick = |ui: &mut Ui, enabled: bool, label: &str, action: Action| -> bool {
+        let clicked = ui.add_enabled(enabled, egui::Button::new(label)).clicked();
+        if clicked {
             actions.push(action);
             ui.close();
         }
+        clicked
     };
+    pick(
+        ui,
+        known,
+        if favorite { "Unfavorite" } else { "Favorite" },
+        Action::ToggleFavorite(program_id),
+    );
     pick(ui, true, "Start Game", Action::Boot(path.clone()));
     pick(
         ui,
@@ -32,7 +41,62 @@ fn game_menu(ui: &mut Ui, entry: &GameEntry, actions: &mut Vec<Action>) {
         Action::BootWithoutCustom(path.clone()),
     );
     ui.separator();
-    let known = entry.meta.is_some();
+    pick(
+        ui,
+        known,
+        "Open Save Data Location",
+        Action::OpenSaveData(program_id),
+    );
+    pick(
+        ui,
+        known,
+        "Open Mod Data Location",
+        Action::OpenModData(program_id),
+    );
+    pick(
+        ui,
+        known,
+        "Open Transferable Pipeline Cache",
+        Action::OpenShaderCache(program_id),
+    );
+    ui.separator();
+    pick(
+        ui,
+        known,
+        "Rebuild Shader Precache",
+        Action::RebuildShaderCache {
+            path: path.clone(),
+            program_id,
+        },
+    );
+    pick(
+        ui,
+        known,
+        "Precompile All Shaders",
+        Action::PrecompileOnly(path.clone()),
+    );
+    pick(
+        ui,
+        known,
+        "Delete Shader Precache",
+        Action::DeleteShaderCache(program_id),
+    );
+    ui.separator();
+    pick(
+        ui,
+        true,
+        "Verify Integrity",
+        Action::VerifyIntegrity(path.clone()),
+    );
+    if pick(
+        ui,
+        known,
+        "Copy Title ID to Clipboard",
+        Action::CopyTitleId(program_id),
+    ) {
+        ui.ctx().copy_text(format!("{program_id:016X}"));
+    }
+    ui.separator();
     pick(
         ui,
         known,
@@ -248,6 +312,16 @@ impl App {
                     actions.push(Action::Hotkey(action));
                 }
             }
+            ui.separator();
+            let preserve_label = if self.settings.ui.preserve_window_size {
+                "✔ Preserve Window Size Across Sessions"
+            } else {
+                "   Preserve Window Size Across Sessions"
+            };
+            if ui.button(preserve_label).clicked() {
+                ui.close();
+                actions.push(Action::TogglePreserveWindowSize);
+            }
         });
         ui.menu_button("Help", |ui| {
             if ui.button("About Lichii").clicked() {
@@ -257,15 +331,122 @@ impl App {
     }
 
     fn status_bar(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let pill = |ui: &mut Ui, label: &str, bg: Color32, fg: Color32| -> egui::Response {
+            ui.add(
+                egui::Button::new(RichText::new(label).color(fg).strong().small())
+                    .fill(bg)
+                    .corner_radius(4.0),
+            )
+        };
         ui.horizontal(|ui| {
-            let message = match (self.current_toast(), &self.session) {
-                (Some(toast), _) => toast.to_string(),
-                (None, Some(s)) if s.is_paused() => format!("{}: paused", s.title),
-                (None, Some(s)) => s.title.clone(),
-                (None, None) if self.games.is_scanning() => "Scanning game directories…".into(),
-                (None, None) => format!("{} games", self.games.entries.len()),
-            };
-            ui.label(message);
+            if self.session.is_some() {
+                let c = self.current();
+                let g = &c.graphics;
+                let a = &c.audio;
+                pill(
+                    ui,
+                    "VULKAN",
+                    Color32::from_rgb(72, 24, 38),
+                    Color32::from_rgb(235, 95, 130),
+                )
+                .on_hover_text("Graphics API: Vulkan");
+
+                let gpu_label = match g.gpu_accuracy {
+                    lichii_common::settings::GpuAccuracy::Low => "FAST",
+                    lichii_common::settings::GpuAccuracy::Normal => "NORMAL",
+                    lichii_common::settings::GpuAccuracy::High => "HIGH",
+                };
+                if pill(
+                    ui,
+                    gpu_label,
+                    Color32::from_rgb(68, 48, 22),
+                    Color32::from_rgb(240, 175, 70),
+                )
+                .on_hover_text("GPU accuracy. Click to cycle (F9).")
+                .clicked()
+                {
+                    actions.push(Action::Hotkey(HotkeyAction::CycleGpuAccuracy));
+                }
+
+                let mode_label = if c.system.docked {
+                    "DOCKED"
+                } else {
+                    "HANDHELD"
+                };
+                if pill(
+                    ui,
+                    mode_label,
+                    Color32::from_rgb(24, 48, 82),
+                    Color32::from_rgb(100, 175, 250),
+                )
+                .on_hover_text("Console mode. Click to toggle Docked / Handheld (F10).")
+                .clicked()
+                {
+                    actions.push(Action::Hotkey(HotkeyAction::ToggleDocked));
+                }
+
+                let filter_label = match g.scaling_filter {
+                    ScalingFilter::NearestNeighbor => "NEAREST".to_owned(),
+                    ScalingFilter::Fsr => "FSR".to_owned(),
+                    filter => filter.label().to_uppercase(),
+                };
+                let filter = pill(
+                    ui,
+                    &filter_label,
+                    Color32::from_rgb(42, 34, 82),
+                    Color32::from_rgb(150, 135, 255),
+                )
+                .on_hover_text("Scaling filter. Click to cycle, right-click to pick.");
+                if filter.clicked() {
+                    actions.push(Action::SetScalingFilter(g.scaling_filter.next()));
+                }
+                pick_menu(&filter, g.scaling_filter, actions, Action::SetScalingFilter);
+
+                let aa_label = match g.anti_aliasing {
+                    AntiAliasing::None => "NO AA".to_owned(),
+                    aa => aa.label().to_uppercase(),
+                };
+                let aa = pill(
+                    ui,
+                    &aa_label,
+                    Color32::from_rgb(20, 62, 72),
+                    Color32::from_rgb(80, 215, 225),
+                )
+                .on_hover_text("Anti-aliasing. Click to cycle, right-click to pick.");
+                if aa.clicked() {
+                    actions.push(Action::SetAntiAliasing(g.anti_aliasing.next()));
+                }
+                pick_menu(&aa, g.anti_aliasing, actions, Action::SetAntiAliasing);
+
+                let vol_label = if a.muted {
+                    "MUTED".to_owned()
+                } else {
+                    format!("VOLUME: {}%", a.volume)
+                };
+                if pill(
+                    ui,
+                    &vol_label,
+                    Color32::from_rgb(66, 32, 78),
+                    Color32::from_rgb(220, 130, 240),
+                )
+                .on_hover_text("Audio volume. Click to mute / unmute.")
+                .clicked()
+                {
+                    actions.push(Action::ToggleMute);
+                }
+
+                if let Some(toast) = self.current_toast() {
+                    ui.separator();
+                    ui.label(toast);
+                }
+            } else {
+                let message = match self.current_toast() {
+                    Some(toast) => toast.to_string(),
+                    None if self.games.is_scanning() => "Scanning game directories…".into(),
+                    None => format!("{} games", self.games.entries.len()),
+                };
+                ui.label(message);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.session.is_none() {
                     if let Some(name) = self.adapter_name() {
@@ -282,39 +463,18 @@ impl App {
                 ui.label(format!("Game: {:.0} FPS", snap.game_fps));
                 ui.separator();
                 let speed = snap.emulation_speed * 100.0;
-                ui.label(match g.speed_limit {
+                let speed_text = match g.speed_limit {
                     Some(limit) => format!("Speed: {speed:.0}% / {limit}%"),
                     None => format!("Speed: {speed:.0}%"),
-                });
-                ui.separator();
-                ui.label(if self.current().system.docked {
-                    "Docked"
-                } else {
-                    "Handheld"
-                });
-                ui.separator();
-                let aa = match g.anti_aliasing {
-                    AntiAliasing::None => "NO AA".to_owned(),
-                    aa => aa.label().to_uppercase(),
                 };
-                let aa = ui
-                    .button(aa)
-                    .on_hover_text("Anti-aliasing. Click to cycle, right-click to pick.");
-                if aa.clicked() {
-                    actions.push(Action::SetAntiAliasing(g.anti_aliasing.next()));
+                if ui
+                    .button(RichText::new(speed_text).small())
+                    .on_hover_text("Click to toggle speed limit (Ctrl+U).")
+                    .clicked()
+                {
+                    actions.push(Action::Hotkey(HotkeyAction::ToggleSpeedLimit));
                 }
-                pick_menu(&aa, g.anti_aliasing, actions, Action::SetAntiAliasing);
-                let filter = ui
-                    .button(match g.scaling_filter {
-                        ScalingFilter::NearestNeighbor => "NEAREST".to_owned(),
-                        ScalingFilter::Fsr => "FSR".to_owned(),
-                        filter => filter.label().to_uppercase(),
-                    })
-                    .on_hover_text("Scaling filter. Click to cycle, right-click to pick.");
-                if filter.clicked() {
-                    actions.push(Action::SetScalingFilter(g.scaling_filter.next()));
-                }
-                pick_menu(&filter, g.scaling_filter, actions, Action::SetScalingFilter);
+                ui.separator();
                 let (num, den) = g.resolution_scale.ratio();
                 let scale = num as f32 / den as f32;
                 ui.menu_button(format!("Scale: {scale}x"), |ui| {
@@ -387,6 +547,9 @@ impl App {
                                         .rect_filled(rect, 6, ui.visuals().faint_bg_color);
                                 }
                             }
+                            let program_id = entry.meta.as_ref().map_or(0, |m| m.program_id);
+                            let is_fav =
+                                program_id != 0 && self.settings.ui.favorites.contains(&program_id);
                             let row = ui.selectable_label(selected, game_name(ui, entry));
                             if row.clicked() {
                                 self.ui.selected = Some(entry.path.clone());
@@ -395,7 +558,7 @@ impl App {
                                 actions.push(Action::Boot(entry.path.clone()));
                             }
                             row.on_hover_text("Double-click to boot; right-click for more")
-                                .context_menu(|ui| game_menu(ui, entry, actions));
+                                .context_menu(|ui| game_menu(ui, entry, is_fav, actions));
                         });
                         let meta = entry.meta.as_ref();
                         let size = if entry.size > 0 {
@@ -645,13 +808,18 @@ impl App {
                 if let Some(crate::app::PrecompileModal::Running {
                     path,
                     without_custom,
+                    boot_after,
                     ..
                 }) = self.ui.precompile.take()
                 {
-                    actions.push(Action::StartNow {
-                        path,
-                        without_custom,
-                    });
+                    if boot_after {
+                        actions.push(Action::StartNow {
+                            path,
+                            without_custom,
+                        });
+                    } else {
+                        self.toast("Shader preparation finished");
+                    }
                 }
             }
         }

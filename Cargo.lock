@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "lichii"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "egui",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "allocation-counter",
  "bytemuck",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "serde",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lichii-audio",
  "lichii-common",
@@ -1612,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-cpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dynasm",
  "dynasmrt",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "cmac",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lichii-crypto",
  "lz4_flex",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "crossbeam-channel",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.13.2",
  "lichii-common",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "crossbeam-channel",
@@ -1694,7 +1694,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lichii-common",
  "lichii-crypto",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "libc",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-services"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "iana-time-zone",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-shader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.13.2",
  "lichii-common",
@@ -1760,7 +1760,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-texture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-video"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "libloading",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "lichii-vulkan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "ash-window",

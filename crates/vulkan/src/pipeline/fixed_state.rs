@@ -355,7 +355,10 @@ impl FixedStateTracker {
         if dirty.take(flags::DEPTH_STENCIL) && self.state.groups & GROUP_DEPTH_STENCIL != 0 {
             self.refresh_depth_stencil(regs);
         }
-        if dirty.take(flags::BLENDING) && self.state.groups & GROUP_BLEND != 0 {
+        // Always rebuild static blend state: native Switch 2 command paths can write blend
+        // registers without raising BLENDING.
+        dirty.take(flags::BLENDING);
+        if self.state.groups & GROUP_BLEND != 0 {
             self.refresh_blending(regs);
         }
         if dirty.take(flags::VERTEX_INPUT) && self.state.groups & GROUP_VERTEX != 0 {
@@ -1027,8 +1030,12 @@ mod tests {
         state.regs.blend.enable[0] = 1;
         let unchanged = *tracker.refresh(&state.regs, &mut state.dirty, topology);
         assert_eq!(
-            unchanged, first,
-            "no flag set: the tracker must not re-read registers"
+            unchanged.depth, first.depth,
+            "no depth flag set: the tracker must not re-read depth registers"
+        );
+        assert_eq!(
+            unchanged.blend[0].enable, 1,
+            "static blend state is always rebuilt"
         );
 
         let depth = word(offset_of!(Regs, depth_test_enable));
@@ -1038,10 +1045,6 @@ mod tests {
         assert!(!state.dirty.is_set(flags::BLENDING));
         let depth_only = *tracker.refresh(&state.regs, &mut state.dirty, topology);
         assert_eq!(depth_only.depth & DEPTH_TEST, DEPTH_TEST);
-        assert_eq!(
-            depth_only.blend, first.blend,
-            "blending was not marked dirty"
-        );
 
         let blend_enable = word(offset_of!(Regs, blend.enable));
         state.write(blend_enable, 0);

@@ -1208,9 +1208,13 @@ pub struct UiSettings {
     pub hide_cursor_when_idle: bool,
     /// Most recently booted files, newest first.
     pub recent_files: Vec<PathBuf>,
+    /// Favorited title IDs in the game list.
+    pub favorites: Vec<u64>,
     pub window_width: u32,
     pub window_height: u32,
     pub window_maximized: bool,
+    /// Keeps the window size and maximized state between sessions.
+    pub preserve_window_size: bool,
     pub hotkeys: BTreeMap<HotkeyAction, Hotkey>,
     /// The keys and firmware setup was closed once; it no longer opens by itself at startup.
     pub setup_done: bool,
@@ -1226,9 +1230,11 @@ impl Default for UiSettings {
             show_status_bar: true,
             hide_cursor_when_idle: true,
             recent_files: Vec::new(),
+            favorites: Vec::new(),
             window_width: 1280,
             window_height: 760,
             window_maximized: false,
+            preserve_window_size: false,
             hotkeys: HotkeyAction::defaults().collect(),
             setup_done: false,
         }

@@ -86,6 +86,20 @@ pub enum Action {
         path: PathBuf,
         without_custom: bool,
     },
+    ToggleFavorite(u64),
+    OpenSaveData(u64),
+    OpenModData(u64),
+    OpenShaderCache(u64),
+    PrecompileOnly(PathBuf),
+    RebuildShaderCache {
+        path: PathBuf,
+        program_id: u64,
+    },
+    DeleteShaderCache(u64),
+    VerifyIntegrity(PathBuf),
+    CopyTitleId(u64),
+    ToggleMute,
+    TogglePreserveWindowSize,
 }
 
 /// The configuration of the running game, when it has one.
@@ -113,6 +127,7 @@ pub enum PrecompileModal {
     Running {
         path: PathBuf,
         without_custom: bool,
+        boot_after: bool,
         title: String,
         status: std::sync::Arc<std::sync::Mutex<PrecompileStatus>>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -586,9 +601,11 @@ impl App {
         self.start(path, without_custom, None);
     }
 
-    fn start_precompile(&mut self, path: PathBuf, without_custom: bool) {
+    fn start_precompile(&mut self, path: PathBuf, without_custom: bool, boot_after: bool) {
         let Some(display) = &self.display else {
-            self.start(path, without_custom, None);
+            if boot_after {
+                self.start(path, without_custom, None);
+            }
             return;
         };
         let device = display.device().clone();
@@ -619,6 +636,7 @@ impl App {
         self.ui.precompile = Some(PrecompileModal::Running {
             path: path.clone(),
             without_custom,
+            boot_after,
             title,
             status: status.clone(),
             cancel: cancel.clone(),
@@ -900,7 +918,109 @@ Dump prod.keys and title.keys \
             Action::PrecompileAndBoot {
                 path,
                 without_custom,
-            } => self.start_precompile(path, without_custom),
+            } => self.start_precompile(path, without_custom, true),
+            Action::ToggleFavorite(program_id) => {
+                if let Some(pos) = self
+                    .settings
+                    .ui
+                    .favorites
+                    .iter()
+                    .position(|&id| id == program_id)
+                {
+                    self.settings.ui.favorites.remove(pos);
+                    self.toast("Removed from favorites");
+                } else {
+                    self.settings.ui.favorites.push(program_id);
+                    self.toast("Added to favorites");
+                }
+            }
+            Action::OpenSaveData(program_id) => {
+                let save_root = self.paths.nand_dir().join("user").join("save");
+                let _ = std::fs::create_dir_all(&save_root);
+                open_folder(&save_root);
+                let _ = program_id;
+            }
+            Action::OpenModData(program_id) => {
+                let mod_dir = self
+                    .paths
+                    .data_dir
+                    .join("load")
+                    .join(format!("{program_id:016X}"));
+                let _ = std::fs::create_dir_all(&mod_dir);
+                open_folder(&mod_dir);
+            }
+            Action::OpenShaderCache(program_id) => {
+                if let Some(dir) = crate::display::shader_cache_dir(&self.paths, program_id) {
+                    let _ = std::fs::create_dir_all(&dir);
+                    open_folder(&dir);
+                }
+            }
+            Action::PrecompileOnly(path) => self.start_precompile(path, false, false),
+            Action::RebuildShaderCache { path, program_id } => {
+                if let Some(dir) = crate::display::shader_cache_dir(&self.paths, program_id) {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                self.start_precompile(path, false, false);
+            }
+            Action::DeleteShaderCache(program_id) => {
+                if let Some(dir) = crate::display::shader_cache_dir(&self.paths, program_id) {
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => self.toast("Deleted shader precache"),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.toast("Shader precache was already empty")
+                        }
+                        Err(e) => {
+                            self.ui.error = Some(format!("Cannot delete {}: {e}", dir.display()))
+                        }
+                    }
+                }
+            }
+            Action::VerifyIntegrity(path) => {
+                let probe = LoadOptions {
+                    keys: Some(self.keys()),
+                    installed: self.installed_content(),
+                    ..LoadOptions::default()
+                };
+                match lichii_loader::load(&path, &probe) {
+                    Ok(img) => {
+                        self.ui.info = Some((
+                            "Verify Integrity".into(),
+                            format!(
+                                "{} ({:016X}) verified successfully ({} modules).",
+                                img.name,
+                                img.program_id,
+                                img.modules.len()
+                            ),
+                        ))
+                    }
+                    Err(e) => {
+                        self.ui.error = Some(format!("Integrity check failed: {e}"));
+                    }
+                }
+            }
+            Action::CopyTitleId(program_id) => {
+                self.toast(format!("Copied Title ID: {program_id:016X}"));
+            }
+            Action::ToggleMute => {
+                self.settings.audio.muted = !self.settings.audio.muted;
+                self.refresh_running();
+                let msg = if self.settings.audio.muted {
+                    "Audio muted"
+                } else {
+                    "Audio unmuted"
+                };
+                self.toast(msg);
+            }
+            Action::TogglePreserveWindowSize => {
+                self.settings.ui.preserve_window_size = !self.settings.ui.preserve_window_size;
+                let msg = if self.settings.ui.preserve_window_size {
+                    "Window size will be preserved across sessions"
+                } else {
+                    "Window size will reset to default next launch"
+                };
+                self.save_settings();
+                self.toast(msg);
+            }
             Action::GameProperties {
                 path,
                 program_id,
@@ -1412,14 +1532,20 @@ Dump prod.keys and title.keys \
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let ui = &self.settings.ui;
-        let attributes = Window::default_attributes()
-            .with_title(format!("Lichii {}", env!("CARGO_PKG_VERSION")))
-            .with_inner_size(winit::dpi::LogicalSize::new(
+        let (width, height, maximized) = if ui.preserve_window_size {
+            (
                 ui.window_width.max(640),
                 ui.window_height.max(400),
-            ))
+                ui.window_maximized,
+            )
+        } else {
+            (1280, 760, false)
+        };
+        let attributes = Window::default_attributes()
+            .with_title(format!("Lichii {}", env!("CARGO_PKG_VERSION")))
+            .with_inner_size(winit::dpi::LogicalSize::new(width, height))
             .with_min_inner_size(winit::dpi::LogicalSize::new(640, 400))
-            .with_maximized(ui.window_maximized);
+            .with_maximized(maximized);
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -1520,11 +1646,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => self.exit_requested = true,
             WindowEvent::Resized(size) => {
                 let ui = &mut self.settings.ui;
-                ui.window_maximized = window.is_maximized();
-                if !ui.window_maximized && window.fullscreen().is_none() {
-                    let logical = size.to_logical::<u32>(window.scale_factor());
-                    ui.window_width = logical.width;
-                    ui.window_height = logical.height;
+                if ui.preserve_window_size {
+                    ui.window_maximized = window.is_maximized();
+                    if !ui.window_maximized && window.fullscreen().is_none() {
+                        let logical = size.to_logical::<u32>(window.scale_factor());
+                        ui.window_width = logical.width;
+                        ui.window_height = logical.height;
+                    }
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
@@ -1588,4 +1716,13 @@ impl ApplicationHandler<UserEvent> for App {
         self.session = None;
         self.save_settings();
     }
+}
+
+fn open_folder(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
