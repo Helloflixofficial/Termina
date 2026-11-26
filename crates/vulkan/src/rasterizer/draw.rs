@@ -957,7 +957,10 @@ impl VulkanRasterizer {
         if !self.graphics_stages(ctx, host_topology, may_skip) {
             return Ok(());
         }
-        if self.oot_bypass_enabled() {
+        if self.oot_bypass_enabled()
+            && let Some(fragment) = self.draw.stages[4].as_ref()
+            && super::oot_network::is_tonemap_shader(fragment.hash)
+        {
             self.oot_bypass.track_render_target(&regs.rt[0]);
         }
 

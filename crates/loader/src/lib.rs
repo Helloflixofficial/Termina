@@ -18,6 +18,7 @@ pub mod nup;
 mod package;
 pub mod patch;
 pub mod program;
+pub mod shader_extract;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod title;

@@ -151,6 +151,30 @@ pub fn decompress(variant: Variant, src: &[u8], dst: &mut [u8]) -> Result<usize>
     Ok(written)
 }
 
+/// Decodes a single `variant` frame from `src` into a newly allocated buffer capped at `max_bytes`.
+pub(crate) fn decompress_all(variant: Variant, src: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut stream = FrameStream::new(variant, Cursor { data: src, pos: 0 })?;
+    let initial = stream
+        .content_size()
+        .map(|s| (s as usize).min(max_bytes))
+        .unwrap_or(64 * 1024);
+    let mut out = vec![0u8; initial.max(4096)];
+    let mut target = out.len();
+    loop {
+        let n = stream.decode_to(&mut out, target)?;
+        if stream.is_finished() {
+            out.truncate(n);
+            return Ok(out);
+        }
+        if out.len() >= max_bytes {
+            return Err(ZstdError::OutputTooSmall);
+        }
+        let next = (out.len() * 2).min(max_bytes);
+        out.resize(next, 0);
+        target = next;
+    }
+}
+
 fn corrupt<T>(what: &'static str) -> Result<T> {
     Err(ZstdError::Corrupt(what))
 }

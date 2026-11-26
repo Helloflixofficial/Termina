@@ -36,4 +36,4 @@ lichii-kernel = { workspace = true, features = ["testing"] }
 lichii-loader = { workspace = true, features = ["testing"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Media"] }
+windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_LibraryLoader", "Win32_System_Threading"] }

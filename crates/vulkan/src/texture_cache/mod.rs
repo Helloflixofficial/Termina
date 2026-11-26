@@ -103,6 +103,10 @@ const RECENT_AGE: u64 = 10;
 /// Frames a cached buffer may sit unused before being collected below budget thresholds (~60 s
 /// at 60 FPS), freeing menu/loading buffers without touching active GPU-written data.
 const IDLE_BUFFER_AGE: u64 = 3600;
+/// Frames a clean image from an earlier area may sit unused on <= 4.5 GiB GPUs before gentle
+/// background eviction frees it, keeping VRAM focused on the active area.
+const IDLE_IMAGE_AGE: u64 = 600;
+const IDLE_IMAGE_EVICTIONS: u32 = 6;
 /// Frames an image or buffer must go unused before the collector may evict it while the
 /// caches hold more than their own budget's expected line ([`CacheBudget`]).
 const BUDGET_AGE: u64 = 30;
@@ -1039,6 +1043,125 @@ pub struct TextureCache {
     budget: CacheBudget,
     /// Total device-local heap bytes queried at creation.
     device_local: u64,
+    /// Adaptive age floor that prevents pressured eviction from thrashing active textures.
+    thrash: ThrashGuard,
+}
+
+const THRASH_GHOST_SLOTS: usize = 2048;
+const THRASH_MAX_FLOOR: u64 = 600;
+const THRASH_BUCKETS: usize = 8;
+
+#[derive(Clone, Copy, Default)]
+struct ThrashGhost {
+    daddr: DAddr,
+    shape: u64,
+    last_use: u64,
+}
+
+#[derive(Default)]
+struct ThrashGuard {
+    ghosts: Vec<ThrashGhost>,
+    window: [u32; THRASH_BUCKETS],
+    floor: u64,
+    calm_frames: u64,
+}
+
+impl ThrashGuard {
+    fn slot(daddr: DAddr, shape: u64) -> usize {
+        let mut h = daddr ^ shape.rotate_left(17);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        (h as usize) & (THRASH_GHOST_SLOTS - 1)
+    }
+
+    fn note_evicted(&mut self, daddr: DAddr, shape: u64, last_use: u64) {
+        if daddr == 0 {
+            return;
+        }
+        if self.ghosts.is_empty() {
+            self.ghosts
+                .resize(THRASH_GHOST_SLOTS, ThrashGhost::default());
+        }
+        let idx = Self::slot(daddr, shape);
+        self.ghosts[idx] = ThrashGhost {
+            daddr,
+            shape,
+            last_use,
+        };
+    }
+
+    fn note_created(&mut self, daddr: DAddr, shape: u64, frame: u64) {
+        if self.ghosts.is_empty() || daddr == 0 {
+            return;
+        }
+        let idx = Self::slot(daddr, shape);
+        let ghost = &mut self.ghosts[idx];
+        if ghost.daddr != daddr || ghost.shape != shape {
+            return;
+        }
+        let interval = frame.saturating_sub(ghost.last_use);
+        *ghost = ThrashGhost::default();
+        if interval <= THRASH_MAX_FLOOR {
+            let mut bucket = 0;
+            while bucket + 1 < THRASH_BUCKETS && interval > (4u64 << bucket) {
+                bucket += 1;
+            }
+            self.window[bucket] = self.window[bucket].saturating_add(1);
+        }
+    }
+
+    fn tick(&mut self, frame: u64, pressure: bool, image_bytes: u64, budget: u64) {
+        const CHECK_FRAMES: u64 = 60;
+        const MIN_REMAKES: u32 = 8;
+        if !frame.is_multiple_of(CHECK_FRAMES) {
+            return;
+        }
+        self.calm_frames = if pressure {
+            0
+        } else {
+            self.calm_frames.saturating_add(CHECK_FRAMES)
+        };
+        let remakes: u32 = self.window.iter().sum();
+        let mut wanted = 0u64;
+        if remakes >= MIN_REMAKES {
+            let mut seen = 0u32;
+            for (bucket, &count) in self.window.iter().enumerate() {
+                seen += count;
+                if seen * 10 >= remakes * 9 {
+                    let gap = 4u64 << bucket;
+                    wanted = (gap + gap / 4 + 2).min(THRASH_MAX_FLOOR);
+                    break;
+                }
+            }
+        }
+        self.window = [0; THRASH_BUCKETS];
+        if wanted > self.floor {
+            self.floor = wanted;
+        } else if self.calm_frames >= 600 && self.floor > 0 {
+            self.floor = self.floor.saturating_sub(self.floor / 8 + 1);
+        }
+        if self.floor > 0 && budget > 0 && image_bytes > (budget / 4) * 3 {
+            self.floor /= 2;
+        }
+    }
+}
+
+fn image_shape_key(info: &ImageInfo) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for value in [
+        u64::from(info.width),
+        u64::from(info.height),
+        u64::from(info.depth),
+        u64::from(info.levels),
+        u64::from(info.layers),
+        u64::from(info.samples),
+        info.format as u64,
+        info.kind as u64,
+    ] {
+        hash = (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// A depth or stencil view returns its value in R and leaves G undefined, while guest
@@ -1444,6 +1567,7 @@ impl TextureCache {
             frame_ends: VecDeque::new(),
             budget: CacheBudget::new(device_local, VramUsage::default()),
             device_local,
+            thrash: ThrashGuard::default(),
             stats: CollectorStats::default(),
         }
     }
@@ -3302,6 +3426,10 @@ impl TextureCache {
         sparse_va: Option<GpuVAddr>,
     ) -> Result<ImageId> {
         self.creations += 1;
+        if let Some(first) = segments.first() {
+            self.thrash
+                .note_created(first.daddr, image_shape_key(info), self.frame);
+        }
         let mut host = self.image_host(info);
         if self.opaque_astc_bc1
             && matches!(host.conversion, Conversion::DecodeToBc(Compression::Bc3))
@@ -4870,11 +4998,18 @@ impl TextureCache {
         let limits = Thresholds::new(usage.budget, self.vram_usage);
         let budget = CacheBudget::new(usage.device_local, self.vram_usage);
         self.budget = budget;
+        let aggressive_hint = used >= limits.critical || cached >= budget.critical;
+        self.thrash
+            .tick(self.frame, aggressive_hint, self.image_bytes, usage.budget);
+        let constrained_vram = (1 << 30..=9 << 29).contains(&usage.device_local);
         if used < limits.expected && cached < budget.expected {
             self.collect_idle_buffers(tx);
+            if constrained_vram {
+                self.collect_idle_images(tx);
+            }
             return Ok(());
         }
-        let mut aggressive = used >= limits.critical || cached >= budget.critical;
+        let mut aggressive = aggressive_hint;
         let age = if used >= limits.retain || cached >= budget.critical {
             RECENT_AGE
         } else if cached >= budget.expected {
@@ -4883,18 +5018,19 @@ impl TextureCache {
             OLD_AGE
         };
         let unused_before = self.unused_before(age);
-        let constrained_vram = (1 << 30..=9 << 29).contains(&usage.device_local);
+        let image_unused_before = self.unused_before(age.max(self.thrash.floor));
+        // Pace cleanup on <= 4.5 GiB GPUs instead of bursting 80 evictions + 32 MiB flushes in one frame.
         let mut evictions = if aggressive {
             if constrained_vram {
-                AGGRESSIVE_EVICTIONS * 2
+                24
             } else {
                 AGGRESSIVE_EVICTIONS
             }
         } else {
             NORMAL_EVICTIONS
         };
-        let max_flush_bytes = if constrained_vram && aggressive {
-            MAX_FLUSH_BYTES * 2
+        let max_flush_bytes = if constrained_vram {
+            MAX_FLUSH_BYTES / 2
         } else {
             MAX_FLUSH_BYTES
         };
@@ -4902,7 +5038,13 @@ impl TextureCache {
         let (mut flush_bytes, mut queued_bytes) = (0, 0);
         let (mut cursor, mut buffer) = (self.lru_head, tx.buffers.lru_head());
         while evictions > 0 && visits > 0 {
-            let Some(oldest) = self.lru_oldest(tx.buffers, cursor, buffer, unused_before) else {
+            let Some(oldest) = self.lru_oldest(
+                tx.buffers,
+                cursor,
+                buffer,
+                unused_before,
+                image_unused_before,
+            ) else {
                 break;
             };
             visits -= 1;
@@ -4993,6 +5135,35 @@ impl TextureCache {
         }
     }
 
+    /// Gently evicts up to [`IDLE_IMAGE_EVICTIONS`] clean images per frame that have gone unused
+    /// for [`IDLE_IMAGE_AGE`] frames (or the thrash floor), freeing textures from earlier areas
+    /// smoothly without stalling the frame.
+    fn collect_idle_images(&mut self, tx: &mut Transfer<'_>) {
+        let unused_before = self.unused_before(IDLE_IMAGE_AGE.max(self.thrash.floor));
+        let mut evictions = IDLE_IMAGE_EVICTIONS;
+        let mut visits = IDLE_IMAGE_EVICTIONS * VISITS_PER_EVICTION;
+        let mut cursor = self.lru_head;
+        while cursor != NIL && evictions > 0 && visits > 0 {
+            let slot = &self.slots[cursor as usize];
+            let id = ImageId {
+                index: cursor,
+                generation: slot.generation,
+            };
+            let next = slot.next;
+            let image = slot.image.as_ref().expect("listed slots hold images");
+            if image.last_use >= unused_before {
+                break;
+            }
+            visits -= 1;
+            cursor = next;
+            if image.gpu_modified {
+                continue;
+            }
+            self.evict(tx.scheduler, id);
+            evictions -= 1;
+        }
+    }
+
     /// The first frame whose entries the collector keeps when it evicts entries unused for
     /// `age` frames: also every frame whose work has not completed.
     fn unused_before(&self, age: u64) -> u64 {
@@ -5011,7 +5182,8 @@ impl TextureCache {
         buffers: &BufferCache,
         image: u32,
         buffer: u32,
-        unused_before: u64,
+        buffer_unused_before: u64,
+        image_unused_before: u64,
     ) -> Option<Lru> {
         let image = (image != NIL).then(|| {
             let slot = &self.slots[image as usize];
@@ -5022,7 +5194,7 @@ impl TextureCache {
             let image = slot.image.as_ref().expect("listed slots hold images");
             (image.last_use, id, slot.next)
         });
-        let oldest = match (image, buffers.lru_entry(buffer)) {
+        let (use_frame, entry) = match (image, buffers.lru_entry(buffer)) {
             (None, None) => return None,
             (Some((image_use, id, next)), Some((buffer_use, _))) if image_use <= buffer_use => {
                 (image_use, Lru::Image { id, next })
@@ -5036,7 +5208,11 @@ impl TextureCache {
                 },
             ),
         };
-        (oldest.0 < unused_before).then_some(oldest.1)
+        let cutoff = match entry {
+            Lru::Image { .. } => image_unused_before,
+            Lru::Buffer { .. } => buffer_unused_before,
+        };
+        (use_frame < cutoff).then_some(entry)
     }
 
     /// Evict-before-create, run after the lookup that created an image of `bytes` linked it in:
@@ -5055,10 +5231,11 @@ impl TextureCache {
         let cached = (self.image_bytes + tx.buffers.cached().bytes).saturating_sub(pending_bytes);
         let critical = self.budget.critical;
         let unused_before = self.unused_before(RECENT_AGE);
+        let image_unused_before = self.unused_before(RECENT_AGE.max(self.thrash.floor));
         if cached > critical {
             let target = (cached - critical).min(bytes);
             let max_evictions = if (1 << 30..=9 << 29).contains(&self.device_local) {
-                CREATE_EVICTIONS * 2
+                CREATE_EVICTIONS / 2
             } else {
                 CREATE_EVICTIONS
             };
@@ -5066,8 +5243,13 @@ impl TextureCache {
             let mut visits = max_evictions * VISITS_PER_EVICTION;
             let (mut cursor, mut buffer) = (self.lru_head, tx.buffers.lru_head());
             while freed < target && evictions > 0 && visits > 0 {
-                let Some(oldest) = self.lru_oldest(tx.buffers, cursor, buffer, unused_before)
-                else {
+                let Some(oldest) = self.lru_oldest(
+                    tx.buffers,
+                    cursor,
+                    buffer,
+                    unused_before,
+                    image_unused_before,
+                ) else {
                     break;
                 };
                 visits -= 1;
@@ -5138,7 +5320,20 @@ impl TextureCache {
     }
 
     fn evict(&mut self, scheduler: &mut Scheduler, id: ImageId) {
-        let bytes = self.get(id).map_or(0, |i| i.image.memory_size());
+        let evicted = self.get(id).map(|image| {
+            (
+                image.base(),
+                image_shape_key(&image.info),
+                image.last_use,
+                image.image.memory_size(),
+            )
+        });
+        let bytes = if let Some((base, shape, last_use, bytes)) = evicted {
+            self.thrash.note_evicted(base, shape, last_use);
+            bytes
+        } else {
+            0
+        };
         self.remove(scheduler, id);
         self.sentenced.push_back((scheduler.tick(), bytes));
         self.sentenced_bytes += bytes;

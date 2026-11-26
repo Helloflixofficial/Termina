@@ -536,6 +536,125 @@ impl App {
                 }
             }
         }
+        enum PrecompileChoice {
+            None,
+            Prepare,
+            PlayNow,
+            Cancel,
+            Finished,
+        }
+        let mut choice = PrecompileChoice::None;
+        let mut remember_skip = false;
+        if let Some(modal) = &mut self.ui.precompile {
+            match modal {
+                crate::app::PrecompileModal::Ask {
+                    title,
+                    dont_ask_again,
+                    ..
+                } => {
+                    egui::Modal::new(egui::Id::unique("precompile_ask")).show(ctx, |ui| {
+                        ui.heading("Prepare shaders before starting?");
+                        ui.add_space(4.0);
+                        ui.label(format!(
+                            "Compile game and cached shaders for {title} before launching so \
+                             gameplay has fewer shader stutters."
+                        ));
+                        ui.add_space(6.0);
+                        ui.checkbox(dont_ask_again, "Don't ask before starting games");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Prepare Shaders & Play").clicked() {
+                                remember_skip = *dont_ask_again;
+                                choice = PrecompileChoice::Prepare;
+                            }
+                            if ui.button("Play Now").clicked() {
+                                remember_skip = *dont_ask_again;
+                                choice = PrecompileChoice::PlayNow;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                choice = PrecompileChoice::Cancel;
+                            }
+                        });
+                    });
+                }
+                crate::app::PrecompileModal::Running {
+                    title,
+                    status,
+                    cancel,
+                    ..
+                } => {
+                    let s = status.lock().expect("precompile status").clone();
+                    if s.finished {
+                        choice = PrecompileChoice::Finished;
+                    } else {
+                        let frac = (s.done as f32 / s.total.max(1) as f32).clamp(0.0, 1.0);
+                        egui::Modal::new(egui::Id::unique("precompile_running")).show(ctx, |ui| {
+                            ui.heading(format!("Preparing shaders for {title}..."));
+                            ui.add_space(4.0);
+                            ui.label(&s.label);
+                            ui.add_space(4.0);
+                            ui.add(egui::ProgressBar::new(frac).show_percentage());
+                            ui.add_space(6.0);
+                            if ui.button("Cancel & Play Now").clicked() {
+                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        });
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        match choice {
+            PrecompileChoice::None => {}
+            PrecompileChoice::Cancel => {
+                self.ui.precompile = None;
+            }
+            PrecompileChoice::Prepare => {
+                if remember_skip {
+                    self.settings.ui.ask_precompile_shaders = false;
+                }
+                if let Some(crate::app::PrecompileModal::Ask {
+                    path,
+                    without_custom,
+                    ..
+                }) = self.ui.precompile.take()
+                {
+                    actions.push(Action::PrecompileAndBoot {
+                        path,
+                        without_custom,
+                    });
+                }
+            }
+            PrecompileChoice::PlayNow => {
+                if remember_skip {
+                    self.settings.ui.ask_precompile_shaders = false;
+                }
+                if let Some(crate::app::PrecompileModal::Ask {
+                    path,
+                    without_custom,
+                    ..
+                }) = self.ui.precompile.take()
+                {
+                    actions.push(Action::StartNow {
+                        path,
+                        without_custom,
+                    });
+                }
+            }
+            PrecompileChoice::Finished => {
+                if let Some(crate::app::PrecompileModal::Running {
+                    path,
+                    without_custom,
+                    ..
+                }) = self.ui.precompile.take()
+                {
+                    actions.push(Action::StartNow {
+                        path,
+                        without_custom,
+                    });
+                }
+            }
+        }
         let mut about = self.ui.about;
         egui::Window::new("About Lichii")
             .open(&mut about)

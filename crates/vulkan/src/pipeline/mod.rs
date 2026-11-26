@@ -12,6 +12,7 @@ pub mod environment;
 pub mod fixed_state;
 pub mod key;
 pub mod maxwell_to_vk;
+pub mod precompile;
 pub mod sampler;
 pub mod shader_cache;
 mod shader_disk;

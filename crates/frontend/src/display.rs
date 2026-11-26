@@ -101,6 +101,10 @@ impl Display {
         &self.device.properties.name
     }
 
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
     /// Applies filter, anti-aliasing, sharpness and present mode from the next frame, and
     /// resolution scale, ASTC recompression and VRAM usage to a running renderer at its next
     /// command flush.

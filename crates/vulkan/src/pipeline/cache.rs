@@ -1654,13 +1654,27 @@ impl PipelineCache {
     /// recent first and at most [`PREBUILD_LIMIT`], whose shaders `resolve` returns,
     /// asynchronously when asynchronous compilation is on; returns how many were queued. The
     /// others build on first use.
-    pub fn prebuild(&mut self, mut resolve: impl FnMut(u64) -> Option<Arc<ShaderModule>>) -> usize {
-        let stored = std::mem::take(&mut self.stored);
+    pub fn prebuild(&mut self, resolve: impl FnMut(u64) -> Option<Arc<ShaderModule>>) -> usize {
         let limit = if lichii_common::is_constrained_host_ram() {
             CONSTRAINED_PREBUILD_LIMIT
         } else {
             PREBUILD_LIMIT
         };
+        self.prebuild_with_limit(limit, resolve)
+    }
+
+    /// Queues all recent pipelines in the disk cache without the boot cap, for explicit
+    /// pre-launch shader preparation.
+    pub fn prebuild_all(&mut self, resolve: impl FnMut(u64) -> Option<Arc<ShaderModule>>) -> usize {
+        self.prebuild_with_limit(usize::MAX, resolve)
+    }
+
+    fn prebuild_with_limit(
+        &mut self,
+        limit: usize,
+        mut resolve: impl FnMut(u64) -> Option<Arc<ShaderModule>>,
+    ) -> usize {
+        let stored = std::mem::take(&mut self.stored);
         let mut queued = 0;
         for selected in prebuild_selection(&stored, limit) {
             let (index, age) = match selected {

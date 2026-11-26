@@ -1201,6 +1201,8 @@ pub struct UiSettings {
     pub theme: Theme,
     /// Ask before stopping a running title.
     pub confirm_stop: bool,
+    /// Ask to pre-compile shaders before starting a title from the UI.
+    pub ask_precompile_shaders: bool,
     pub pause_when_unfocused: bool,
     pub show_status_bar: bool,
     pub hide_cursor_when_idle: bool,
@@ -1219,6 +1221,7 @@ impl Default for UiSettings {
         Self {
             theme: Theme::Dark,
             confirm_stop: true,
+            ask_precompile_shaders: true,
             pause_when_unfocused: false,
             show_status_bar: true,
             hide_cursor_when_idle: true,

@@ -108,6 +108,8 @@ const FPS_UNLOCK_NAME: &str = "FPS Unlock (built-in)";
 const DYNAMIC_FPS_NAME: &str = "Dynamic FPS by Dark (built-in)";
 const TEXTURE_POOL_NAME: &str = "Texture Pool x2 (built-in)";
 const TEXTURE_COMPACTION_NAME: &str = "Texture heap compaction interval (built-in)";
+const SHADOW_STEPS_NAME: &str = "Shadow Size Steps (built-in)";
+const OCCLUSION_OFF_NAME: &str = "Occlusion Off (built-in)";
 
 const MAX_RESOLUTION_ORIGINAL: [u8; 4] = [0xE8, 0x41, 0x00, 0x36];
 const MAX_RESOLUTION_BRANCH: [u8; 4] = [0x0F, 0x02, 0x00, 0x14];
@@ -572,6 +574,75 @@ const WONDER_60FPS_RECORDS: &[Record] = &[
     Record::patch(0x1BC04C, &WONDER_RATE_60, &WONDER_FALLBACK_LOAD),
 ];
 
+const SHADOW_STEPS_ORIGINAL: [u8; 4] = [0xAA, 0xEA, 0x44, 0xB9];
+const SHADOW_STEPS_BRANCH: [u8; 4] = [0x30, 0x0B, 0xE8, 0x14];
+const SHADOW_STEPS_CAVE: [u8; 16] = [
+    0xAA, 0xEA, 0x44, 0xB9, 0x4A, 0xFD, 0x00, 0x11, 0x4A, 0x65, 0x1A, 0x12, 0xCE, 0xF4, 0x17, 0x17,
+];
+const SHADOW_STEPS_RECORDS: &[Record] = &[
+    Record::patch(0x244100, &SHADOW_STEPS_BRANCH, &SHADOW_STEPS_ORIGINAL),
+    Record::cave(0x3C46DC0, &SHADOW_STEPS_CAVE),
+];
+
+const OCCLUSION_LDRB_ORIGINAL: [u8; 4] = [0x08, 0x00, 0x40, 0x39];
+const OCCLUSION_MOV_WZR: [u8; 4] = [0xE8, 0x03, 0x1F, 0x2A];
+const OCCLUSION_OFF_RECORDS: &[Record] = &[
+    Record::patch(0x11ACE68, &OCCLUSION_MOV_WZR, &OCCLUSION_LDRB_ORIGINAL),
+    Record::patch(0x11B828C, &OCCLUSION_MOV_WZR, &OCCLUSION_LDRB_ORIGINAL),
+    Record::patch(0x11B82A4, &OCCLUSION_MOV_WZR, &OCCLUSION_LDRB_ORIGINAL),
+    Record::patch(0x11ACEC8, &OCCLUSION_MOV_WZR, &OCCLUSION_LDRB_ORIGINAL),
+    Record::patch(0x11B82DC, &OCCLUSION_MOV_WZR, &OCCLUSION_LDRB_ORIGINAL),
+    Record::patch(0x11B82F4, &OCCLUSION_MOV_WZR, &OCCLUSION_LDRB_ORIGINAL),
+];
+
+const fn render_scale_bytes(float_top: u32) -> [u8; 4] {
+    (0x52A0_0009u32 | (float_top << 5)).to_le_bytes()
+}
+const RENDER_SCALE_ONE: [u8; 4] = render_scale_bytes(0x3F80);
+const RENDER_SCALE_360: [u8; 4] = render_scale_bytes(0x3E80);
+const RENDER_SCALE_540: [u8; 4] = render_scale_bytes(0x3EC0);
+const RENDER_SCALE_720: [u8; 4] = render_scale_bytes(0x3F00);
+const RENDER_SCALE_810: [u8; 4] = render_scale_bytes(0x3F10);
+const RENDER_SCALE_900: [u8; 4] = render_scale_bytes(0x3F20);
+const RENDER_SCALE_1080: [u8; 4] = render_scale_bytes(0x3F40);
+const RENDER_SCALE_1260: [u8; 4] = render_scale_bytes(0x3F60);
+
+const RENDER_360_RECORDS: &[Record] = &[Record::patch(
+    0x806420,
+    &RENDER_SCALE_360,
+    &RENDER_SCALE_ONE,
+)];
+const RENDER_540_RECORDS: &[Record] = &[Record::patch(
+    0x806420,
+    &RENDER_SCALE_540,
+    &RENDER_SCALE_ONE,
+)];
+const RENDER_720_RECORDS: &[Record] = &[Record::patch(
+    0x806420,
+    &RENDER_SCALE_720,
+    &RENDER_SCALE_ONE,
+)];
+const RENDER_810_RECORDS: &[Record] = &[Record::patch(
+    0x806420,
+    &RENDER_SCALE_810,
+    &RENDER_SCALE_ONE,
+)];
+const RENDER_900_RECORDS: &[Record] = &[Record::patch(
+    0x806420,
+    &RENDER_SCALE_900,
+    &RENDER_SCALE_ONE,
+)];
+const RENDER_1080_RECORDS: &[Record] = &[Record::patch(
+    0x806420,
+    &RENDER_SCALE_1080,
+    &RENDER_SCALE_ONE,
+)];
+const RENDER_1260_RECORDS: &[Record] = &[Record::patch(
+    0x806420,
+    &RENDER_SCALE_1260,
+    &RENDER_SCALE_ONE,
+)];
+
 #[allow(clippy::single_range_in_vec_init)]
 const PATCHES: &[BuiltinPatch] = &[
     BuiltinPatch {
@@ -728,6 +799,141 @@ const PATCHES: &[BuiltinPatch] = &[
         group: None,
         description: "Limits requests for new texture heap compaction rounds to once per guest \
                       second. This may increase heap fragmentation. Restart the game to apply.",
+    },
+    BuiltinPatch {
+        name: SHADOW_STEPS_NAME,
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: SHADOW_STEPS_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: false,
+        group: None,
+        description: "Rounds local shadow depth map sizes up to multiples of 64 so moving around \
+                      reuses pooled depth images instead of creating thousands of new ones.",
+    },
+    BuiltinPatch {
+        name: OCCLUSION_OFF_NAME,
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: OCCLUSION_OFF_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: None,
+        description: "Disables z-prepass occlusion and samples-passed queries so every candidate \
+                      object draws without waiting on occlusion readbacks.",
+    },
+    BuiltinPatch {
+        name: "1260p render (built-in)",
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: RENDER_1260_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: Some("Render Height"),
+        description: "Requires Max Resolution (built-in). Scales OoT's internal 3D render to \
+                      2240x1260 while keeping emulator Resolution Scale at 1x.",
+    },
+    BuiltinPatch {
+        name: "1080p render (built-in)",
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: RENDER_1080_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: Some("Render Height"),
+        description: "Requires Max Resolution (built-in). Scales OoT's internal 3D render to \
+                      1920x1080 while keeping emulator Resolution Scale at 1x.",
+    },
+    BuiltinPatch {
+        name: "900p render (built-in)",
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: RENDER_900_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: Some("Render Height"),
+        description: "Requires Max Resolution (built-in). Scales OoT's internal 3D render to \
+                      1600x900 while keeping emulator Resolution Scale at 1x.",
+    },
+    BuiltinPatch {
+        name: "810p render (built-in)",
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: RENDER_810_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: Some("Render Height"),
+        description: "Requires Max Resolution (built-in). Scales OoT's internal 3D render to \
+                      1440x810 while keeping emulator Resolution Scale at 1x.",
+    },
+    BuiltinPatch {
+        name: "720p render (built-in)",
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: RENDER_720_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: Some("Render Height"),
+        description: "Requires Max Resolution (built-in). Scales OoT's internal 3D render to \
+                      1280x720 while keeping emulator Resolution Scale at 1x.",
+    },
+    BuiltinPatch {
+        name: "540p render (built-in)",
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: RENDER_540_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: Some("Render Height"),
+        description: "Requires Max Resolution (built-in). Scales OoT's internal 3D render to \
+                      960x540 while keeping emulator Resolution Scale at 1x.",
+    },
+    BuiltinPatch {
+        name: "360p render (built-in)",
+        title_id: OCARINA_OF_TIME,
+        module: "main",
+        build_id: &OCARINA_MAIN_BUILD_ID,
+        records: RENDER_360_RECORDS,
+        states: &[],
+        hooks: &[],
+        replaces: None,
+        requires_patch: None,
+        off_by_default: true,
+        group: Some("Render Height"),
+        description: "Requires Max Resolution (built-in). Scales OoT's internal 3D render to \
+                      640x360 while keeping emulator Resolution Scale at 1x.",
     },
     BuiltinPatch {
         name: "Full Scene Resolution with FXAA (built-in)",
@@ -1175,5 +1381,23 @@ mod tests {
         assert_eq!(&skipped.image[0x6E6CC4..0x6E6CC8], &DYNAMIC_FPS_ORIGINAL);
         // Max Resolution still applied.
         assert_eq!(&skipped.image[0x805BD0..0x805BD4], &MAX_RESOLUTION_BRANCH);
+    }
+
+    #[test]
+    fn shadow_steps_and_render_height_apply_cleanly() {
+        let base = fake_main(&OCARINA_MAIN_BUILD_ID);
+        let default_patched = patched(&base, true, &[]);
+        assert_eq!(branch_target(&default_patched.image, 0x244100), 0x3C46DC0);
+        assert_eq!(
+            &default_patched.image[0x3C46DC0..0x3C46DD0],
+            &SHADOW_STEPS_CAVE
+        );
+        assert_eq!(
+            &default_patched.image[0x806420..0x806424],
+            &RENDER_SCALE_ONE
+        );
+
+        let scaled = patched(&base, true, &[&enabled_addon_key("720p render (built-in)")]);
+        assert_eq!(&scaled.image[0x806420..0x806424], &RENDER_SCALE_720);
     }
 }

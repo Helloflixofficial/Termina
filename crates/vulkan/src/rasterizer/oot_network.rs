@@ -35,6 +35,16 @@ pub const OUTPUT_PROGRAM_KEY: u64 = 0xda6d_f3e5_4c71_6df2;
 pub const INPUT_IMAGE_HANDLE_OFFSET: u32 = 0xc0;
 pub const OUTPUT_IMAGE_HANDLE_OFFSET: u32 = 0xd0;
 
+/// Fragment shader hashes of OoT's tonemap passes whose RT0 is the AA network's input.
+pub const fn is_tonemap_shader(hash: u64) -> bool {
+    matches!(
+        hash,
+        0xbded_5ce9_1718_3214 // outdoors
+            | 0x6cb0_6edf_14be_1d79 // indoors
+            | 0x3ac0_11bd_2d77_2994 // outdoors at another time of day
+    )
+}
+
 #[derive(Clone, Copy)]
 struct BaseOutputProgram {
     first_word: u32,
@@ -525,5 +535,14 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn recognizes_tonemap_fragment_shaders() {
+        assert!(is_tonemap_shader(0xbded_5ce9_1718_3214));
+        assert!(is_tonemap_shader(0x6cb0_6edf_14be_1d79));
+        assert!(is_tonemap_shader(0x3ac0_11bd_2d77_2994));
+        assert!(!is_tonemap_shader(0));
+        assert!(!is_tonemap_shader(OUTPUT_PROGRAM_KEY));
     }
 }

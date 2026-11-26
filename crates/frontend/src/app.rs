@@ -78,6 +78,14 @@ pub enum Action {
         path: PathBuf,
         program_id: u64,
     },
+    StartNow {
+        path: PathBuf,
+        without_custom: bool,
+    },
+    PrecompileAndBoot {
+        path: PathBuf,
+        without_custom: bool,
+    },
 }
 
 /// The configuration of the running game, when it has one.
@@ -85,6 +93,30 @@ struct RunningConfig {
     config: GameConfig,
     /// The global settings with the game's overrides applied.
     settings: Settings,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrecompileStatus {
+    pub label: String,
+    pub done: usize,
+    pub total: usize,
+    pub finished: bool,
+}
+
+pub enum PrecompileModal {
+    Ask {
+        path: PathBuf,
+        without_custom: bool,
+        title: String,
+        dont_ask_again: bool,
+    },
+    Running {
+        path: PathBuf,
+        without_custom: bool,
+        title: String,
+        status: std::sync::Arc<std::sync::Mutex<PrecompileStatus>>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 /// Dialogs and transient messages.
@@ -95,6 +127,7 @@ pub struct UiState {
     pub info: Option<(String, String)>,
     pub about: bool,
     pub confirm_stop: bool,
+    pub precompile: Option<PrecompileModal>,
     pub toast: Option<(String, Instant)>,
     pub selected: Option<PathBuf>,
 }
@@ -515,9 +548,174 @@ impl App {
         window.set_fullscreen(mode);
     }
 
-    /// Boots the title at `path`, with its custom configuration unless `without_custom`.
+    /// Boots the title at `path`, prompting to pre-compile shaders only if not already prepared.
     fn boot(&mut self, path: PathBuf, without_custom: bool) {
+        if self.settings.ui.ask_precompile_shaders && self.display.is_some() {
+            let entry = self.games.entries.iter().find(|g| g.path == path);
+            let program_id = entry
+                .and_then(|g| g.meta.as_ref().map(|m| m.program_id))
+                .unwrap_or_else(|| {
+                    let probe = LoadOptions {
+                        keys: Some(self.keys()),
+                        installed: self.installed_content(),
+                        ..LoadOptions::default()
+                    };
+                    lichii_loader::scan(&path, &probe).map_or(0, |info| info.program_id)
+                });
+            let needs_precompile = crate::display::shader_cache_dir(&self.paths, program_id)
+                .is_some_and(|dir| !lichii_vulkan::pipeline::precompile::is_precompiled(&dir));
+            if needs_precompile {
+                let title = entry
+                    .and_then(|g| g.meta.as_ref().map(|m| m.title.clone()))
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| {
+                        path.file_stem().map_or_else(
+                            || "this game".into(),
+                            |s| s.to_string_lossy().into_owned(),
+                        )
+                    });
+                self.ui.precompile = Some(PrecompileModal::Ask {
+                    path,
+                    without_custom,
+                    title,
+                    dont_ask_again: false,
+                });
+                return;
+            }
+        }
         self.start(path, without_custom, None);
+    }
+
+    fn start_precompile(&mut self, path: PathBuf, without_custom: bool) {
+        let Some(display) = &self.display else {
+            self.start(path, without_custom, None);
+            return;
+        };
+        let device = display.device().clone();
+        let title = self
+            .games
+            .entries
+            .iter()
+            .find(|g| g.path == path)
+            .and_then(|g| g.meta.as_ref().map(|m| m.title.clone()))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map_or_else(|| "Game".into(), |s| s.to_string_lossy().into_owned())
+            });
+        let config_dir = self.config_dir();
+        let keys = Some(self.keys());
+        let installed = self.installed_content();
+        let paths = self.paths.clone();
+        let global_settings = self.settings.clone();
+        let proxy = self.proxy.clone();
+        let status = std::sync::Arc::new(std::sync::Mutex::new(PrecompileStatus {
+            label: "Scanning game files...".into(),
+            done: 0,
+            total: 1,
+            finished: false,
+        }));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.ui.precompile = Some(PrecompileModal::Running {
+            path: path.clone(),
+            without_custom,
+            title,
+            status: status.clone(),
+            cancel: cancel.clone(),
+        });
+
+        let _ = std::thread::Builder::new()
+            .name("shader-precompile".into())
+            .spawn(move || {
+                use lichii_loader::shader_extract::{ExtractedStage, extract_from_romfs};
+                use lichii_vulkan::pipeline::precompile::{
+                    PrecompilePhase, ShaderArch, ShaderStage, precompile_title,
+                };
+
+                let probe = LoadOptions {
+                    keys,
+                    installed,
+                    ..LoadOptions::default()
+                };
+                if let Ok(loaded) = lichii_loader::load(&path, &probe) {
+                    let program_id = loaded.program_id;
+                    let cache_dir = crate::display::shader_cache_dir(&paths, program_id);
+                    let graphics = if without_custom {
+                        global_settings.graphics.clone()
+                    } else {
+                        let cfg =
+                            GameConfig::load(GameConfig::path(&config_dir, program_id, &path));
+                        cfg.apply(&global_settings).graphics
+                    };
+                    let extracted = if let Some(romfs_file) = &loaded.romfs
+                        && let Ok(romfs_dir) = lichii_fs::romfs::open_romfs(romfs_file)
+                    {
+                        extract_from_romfs(&romfs_dir, &cancel, |done, total| {
+                            if done % 32 == 0 || done == total {
+                                if let Ok(mut s) = status.lock() {
+                                    s.label = format!("Scanning game files: {done} / {total}");
+                                    s.done = done;
+                                    s.total = total.max(1);
+                                }
+                                let _ = proxy.send_event(UserEvent::Wake);
+                            }
+                        })
+                    } else {
+                        Vec::new()
+                    };
+                    let shaders: Vec<(ShaderStage, Vec<u8>)> = extracted
+                        .into_iter()
+                        .map(|e| {
+                            let stage = match e.stage {
+                                ExtractedStage::Vertex => ShaderStage::VertexB,
+                                ExtractedStage::TessControl => ShaderStage::TessellationControl,
+                                ExtractedStage::TessEval => ShaderStage::TessellationEval,
+                                ExtractedStage::Geometry => ShaderStage::Geometry,
+                                ExtractedStage::Fragment => ShaderStage::Fragment,
+                                ExtractedStage::Compute => ShaderStage::Compute,
+                                ExtractedStage::Task => ShaderStage::Task,
+                                ExtractedStage::Mesh => ShaderStage::Mesh,
+                            };
+                            (stage, e.code)
+                        })
+                        .collect();
+                    let arch = match loaded.generation {
+                        lichii_common::ConsoleGeneration::Switch2 => ShaderArch::Ampere,
+                        lichii_common::ConsoleGeneration::Switch1 => ShaderArch::Maxwell,
+                    };
+                    if let Some(dir) = cache_dir {
+                        let _ = precompile_title(
+                            &device,
+                            &graphics,
+                            &dir,
+                            arch,
+                            &shaders,
+                            &cancel,
+                            |p| {
+                                if let Ok(mut s) = status.lock() {
+                                    s.label = match p.phase {
+                                        PrecompilePhase::Translating => format!(
+                                            "Translating shaders: {} / {} ({} cached)",
+                                            p.done, p.total, p.translated
+                                        ),
+                                        PrecompilePhase::BuildingPipelines => format!(
+                                            "Building Vulkan pipelines: {} / {}",
+                                            p.done, p.total
+                                        ),
+                                    };
+                                    s.done = p.done;
+                                    s.total = p.total.max(1);
+                                }
+                                let _ = proxy.send_event(UserEvent::Wake);
+                            },
+                        );
+                    }
+                }
+                if let Ok(mut s) = status.lock() {
+                    s.finished = true;
+                }
+                let _ = proxy.send_event(UserEvent::Wake);
+            });
     }
 
     /// Boots `path`, or with `restart`, the program its running session asked for in that
@@ -695,6 +893,14 @@ Dump prod.keys and title.keys \
             Action::Hotkey(hotkey) => self.hotkey(hotkey),
             Action::Boot(path) => self.boot(path, false),
             Action::BootWithoutCustom(path) => self.boot(path, true),
+            Action::StartNow {
+                path,
+                without_custom,
+            } => self.start(path, without_custom, None),
+            Action::PrecompileAndBoot {
+                path,
+                without_custom,
+            } => self.start_precompile(path, without_custom),
             Action::GameProperties {
                 path,
                 program_id,
@@ -1276,7 +1482,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         if let Some(path) = self.pending_boot.take() {
-            self.boot(path, false);
+            self.start(path, false, None);
         }
         if self.start_fullscreen {
             self.set_fullscreen(true);

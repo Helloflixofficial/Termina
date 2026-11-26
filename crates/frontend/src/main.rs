@@ -11,6 +11,7 @@ mod hotkeys;
 mod input_worker;
 mod install;
 mod per_game;
+mod process_boost;
 mod session;
 mod setup;
 mod timer_resolution;
@@ -86,6 +87,7 @@ fn main() -> ExitCode {
     unsafe { lichii_vulkan::debug::init(&settings.debug, &paths.data_dir.join("gpucrash")) };
 
     let _timer_resolution = timer_resolution::TimerResolution::raise();
+    process_boost::apply();
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(e) => {
